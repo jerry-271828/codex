@@ -49,6 +49,19 @@ jobs:
         with:
           persist-credentials: false
 
+      # cargo 缓存(全量 workspace target,数十 GB)+ OHOS SDK 展开会挤爆
+      # 标准 runner 的磁盘(实测 "No space left on device" 死在缓存恢复)。
+      # 清掉预装的无关大件,可腾 ~25GB。
+      - name: Free runner disk space
+        run: |
+          set -euo pipefail
+          df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/lib/jvm /usr/share/swift 2>/dev/null || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
+
       - name: Print runner specs
         run: |
           set -euo pipefail
