@@ -96,14 +96,22 @@ jobs:
 
       # 上游脚本：zigcc/zigcxx 交叉编译 aws-lc / boringssl 等原生依赖到 musl，
       # 构建 libcap.a，写入 CC_/CXX_/CARGO_TARGET_*_LINKER 等到 $GITHUB_ENV。
-      # BUILD_CC=cc：libcap 的 _makenames 是构建期工具，必须用宿主(x64) cc 编，
-      # 否则被 aarch64 shim 编成 arm64 → "Exec format error"（上游脚本原本
-      # 跑在 arm64 runner 上宿主==目标，没暴露这个问题）。libcap Make.Rules
-      # 的 BUILD_CC ?= $(CC) 尊重环境变量。
+      # 该脚本本为 arm64 runner 写的（宿主==目标），在 x64 上交叉编 libcap 有两个坑，
+      # 用 sed 预 patch 脚本内的 libcap make 命令行修复（命令行赋值优先级最高，
+      # 必定生效，不受 Make 的 ?= / 环境变量优先级影响）：
+      #   1. BUILD_CC=cc：_makenames 是构建期工具，必须宿主(x64) cc 编，
+      #      否则被 aarch64 shim 编成 arm64 → "Exec format error"。
+      #   2. SHARED=no：脚本只取 libcap.a，但 make 默认 all 还会造 libcap.so，
+      #      其中 objcopy --dump-section 处理 aarch64 ELF 在宿主 objcopy 上炸
+      #      （"Unable to recognise the format"）。只建静态库即可。
       - name: Install musl build tools (zig cross toolchain)
-        env:
-          BUILD_CC: cc
-        run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
+        run: |
+          set -euo pipefail
+          sed -i 's|make -C "${libcap_source_dir}/libcap" -j"$(nproc)" \\|make -C "${libcap_source_dir}/libcap" -j"$(nproc)" BUILD_CC=cc SHARED=no \\|' \
+            "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
+          # 确认 patch 生效
+          grep -n 'BUILD_CC=cc SHARED=no' "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
+          bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
 
       # 见上游 rust-release.yml：musl 上 aws-lc 的 jitter entropy 路径有问题，关掉。
       - name: Disable aws-lc jitter entropy (musl)
