@@ -255,9 +255,18 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-feature=+crt-static -C relocation-model=pic -C link-arg=-static-pie -C link-arg=-Wl,--code-sign -C link-arg=-Wl,--strip-debug -C link-arg=-Wl,--error-limit=0"
         run: |
           set -euo pipefail
+          # 强制重编 bwrap 的 build-script 与 vendored C：cargo/cc-rs 不会因
+          # CFLAGS 环境变量变化而让 C 对象缓存失效，上一轮缓存的 bubblewrap .o
+          # 仍带 emutls 调用。用 cargo clean -p 精准清掉 bwrap 包的产物，确保
+          # 新的 -fno-emulated-tls 生效。
+          cargo clean -p codex-bwrap --target "$TARGET" --release || true
           cargo build --target "$TARGET" --release --bin bwrap
           BW="target/${TARGET}/release/bwrap"
           test -f "$BW"
+          # 确认符号已消除（早失败早报错，胜过链接期）
+          if "$OHOS_NATIVE/llvm/bin/llvm-nm" "$BW" 2>/dev/null | grep -q '__emutls_get_address'; then
+            echo "still references __emutls_get_address"; exit 1
+          fi
           # bwrap 已是链接期 strip+签名的最终字节，直接对其算摘要（不能再 strip，
           # 否则毁签名且改变字节使摘要与打包内容不符）。
           digest="$(sha256sum "$BW" | awk '{print $1}')"
