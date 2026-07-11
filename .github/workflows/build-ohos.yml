@@ -1,0 +1,143 @@
+name: Build codex for HarmonyOS PC (aarch64 musl, static-PIE)
+
+# 为鸿蒙 PC（OpenHarmony / HarmonyOS PC，arm64_ohos）构建 codex CLI。
+#
+# 背景（见 harmonybrew 适配经验）：
+#   * codex 硬依赖 v8（code-mode 运行时），rusty_v8 官方无 OHOS 预编译库，
+#     但 openai/codex 自己的 CI 构建了 aarch64-unknown-linux-musl 版 librusty_v8，
+#     发布在 openai/codex 的 rusty-v8-v<ver> release 里。全静态 musl 二进制
+#     不依赖任何动态库/ohos loader，可直接在鸿蒙 PC 上跑。
+#   * 鸿蒙 PC 内核对 execve 强制校验代码签名，且只放行 PIE（ET_DYN）。
+#     因此这里用 -static-pie 产出全静态的 PIE；.codesign 签名在设备侧用
+#     binary-sign-tool 自签补上（GitHub 无 OHOS lld，无法链接期签名；
+#     musl 目标也用不了 OHOS 的 --code-sign）。
+#   * 复用上游两份现成资产，避免重复造轮子：
+#       .github/actions/setup-rusty-v8      —— 下载并校验 musl 版 librusty_v8
+#       .github/scripts/install-musl-build-tools.sh —— zig cc + libcap + aws-lc 环境
+#
+# 触发后到「Artifacts」下载 codex-ohos-aarch64，设备侧签名步骤见 job summary。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ohos-build]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # GitHub 托管的公共 arm64 runner：目标即宿主架构，musl 交叉工具链由
+    # install-musl-build-tools.sh 用 zig 提供，无需自托管 arm64 runner。
+    runs-on: ubuntu-24.04-arm
+    env:
+      TARGET: aarch64-unknown-linux-musl
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Print runner specs
+        run: |
+          set -euo pipefail
+          echo "OS: $(uname -a)"
+          echo "Logical CPUs: $(nproc)"
+          awk '/MemTotal/ {printf "Total RAM: %.1f GiB\n", $2/1024/1024}' /proc/meminfo
+          df -h .
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            codex-rs/target
+          key: ohos-cargo-${{ hashFiles('codex-rs/Cargo.lock') }}
+          restore-keys: ohos-cargo-
+
+      # 上游脚本：安装 zig，用 zigcc/zigcxx 交叉编译 aws-lc / boringssl 等
+      # 原生依赖到 musl，构建 libcap.a，并写入一大批 CC_/CXX_/CARGO_TARGET_*_LINKER
+      # 等环境变量到 $GITHUB_ENV。原生 arm64 runner 上 zig 目标 == 宿主架构。
+      - name: Install musl build tools (zig cross toolchain)
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
+
+      # 见上游 rust-release.yml：musl 上 aws-lc 的 jitter entropy 路径有问题，关掉。
+      - name: Disable aws-lc jitter entropy (musl)
+        run: |
+          set -euo pipefail
+          echo "AWS_LC_SYS_NO_JITTER_ENTROPY=1" >> "$GITHUB_ENV"
+          echo "AWS_LC_SYS_NO_JITTER_ENTROPY_aarch64_unknown_linux_musl=1" >> "$GITHUB_ENV"
+
+      # 上游 composite action：解析 Cargo.toml 里钉的 v8 版本，从 openai/codex
+      # 的 rusty-v8-v<ver> release 下载 librusty_v8_release_<target>.a.gz +
+      # src_binding，校验 sha256，导出 RUSTY_V8_ARCHIVE / RUSTY_V8_SRC_BINDING_PATH。
+      - name: Configure rusty_v8 artifact overrides
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: aarch64-unknown-linux-musl
+
+      # -static-pie：全静态 + PIE(ET_DYN)。鸿蒙 PC 只放行 PIE；普通 -static
+      # 产出 ET_EXEC，签名也会被 execve 以 EPERM 拒绝（本机已实测：EXEC 版
+      # 签名能过校验但一运行即 SIGSEGV）。static-pie 仍零动态依赖。
+      # relocation-model=pic 确保所有 crate 及 C 依赖按 PIC 编译。
+      - name: Cargo build codex (static-PIE)
+        working-directory: codex-rs
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static -C relocation-model=pic -C link-arg=-static-pie"
+        run: |
+          set -euo pipefail
+          cargo build --target "$TARGET" --release --bin codex
+
+      - name: Verify ELF is aarch64 static PIE
+        working-directory: codex-rs
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/codex"
+          test -f "$BIN"
+          sudo apt-get install -y file >/dev/null 2>&1 || true
+          file "$BIN"
+          # 必须是 ET_DYN（PIE）
+          readelf -h "$BIN" | grep -q "DYN" \
+            || { echo "codex is not PIE (ET_DYN required by HarmonyOS PC)"; exit 1; }
+          # 必须无 INTERP（全静态）——否则设备上无 ohos musl loader 会跑不起来
+          if readelf -l "$BIN" | grep -q INTERP; then
+            echo "codex has INTERP segment; not statically linked"; exit 1
+          fi
+          echo "OK: aarch64 static-PIE, no INTERP"
+          ls -la "$BIN"
+
+      - name: Stage artifact
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "codex-rs/target/${TARGET}/release/codex" dist/codex
+          sha256sum dist/codex | tee dist/codex.sha256
+
+      - name: Write device-side signing instructions to summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## 设备侧签名（鸿蒙 PC 上执行一次）
+
+          下载 artifact 解压得到 `codex` 后，在鸿蒙 PC 终端：
+
+          ```sh
+          # 放到可执行分区（/storage 下的用户目录即可，/data/local/tmp 被 noexec 拦）
+          chmod +x codex
+          # 自签名：追加 .codesign 节，过内核代码签名校验
+          binary-sign-tool sign -inFile codex -outFile codex -selfSign 1
+          # 校验根哈希正确
+          python3 ~/.claude/skills/harmonybrew/scripts/verify-codesign.py codex   # 期望 MATCH: True
+          ./codex --version
+          ```
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-ohos-aarch64
+          path: dist/
+          if-no-files-found: error
