@@ -239,61 +239,106 @@ jobs:
       #   -Wl,--strip-debug → 链接期去 debug 段（链接后 strip 会毁签名，
       #     必须在链接参数里做；否则产物 1.3GB）
       #   -Wl,--error-limit=0 → 失败时打全错误便于迭代
-      - name: Cargo build codex (static-PIE, OHOS libc, signed)
+      # 完整发布版含 4 个二进制：codex（主）、codex-code-mode-host（code-mode/v8
+      # 运行时子进程）、codex-responses-api-proxy、bwrap（沙箱助手）。构建顺序
+      # 关键：bwrap 必须先构建并定稿（含链接期签名+strip，因签名字节计入摘要），
+      # 算出 sha256 注入 CODEX_BWRAP_SHA256，再编 codex——codex 用 option_env!
+      # 在编译期嵌入该摘要，运行时校验 codex-resources/bwrap 的完整性。
+      - name: Build bwrap first and export its digest
         working-directory: codex-rs
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-feature=+crt-static -C relocation-model=pic -C link-arg=-static-pie -C link-arg=-Wl,--code-sign -C link-arg=-Wl,--strip-debug -C link-arg=-Wl,--error-limit=0"
         run: |
           set -euo pipefail
-          cargo build --target "$TARGET" --release --bin codex
+          cargo build --target "$TARGET" --release --bin bwrap
+          BW="target/${TARGET}/release/bwrap"
+          test -f "$BW"
+          # bwrap 已是链接期 strip+签名的最终字节，直接对其算摘要（不能再 strip，
+          # 否则毁签名且改变字节使摘要与打包内容不符）。
+          digest="$(sha256sum "$BW" | awk '{print $1}')"
+          echo "CODEX_BWRAP_SHA256=${digest}" >> "$GITHUB_ENV"
+          echo "bwrap sha256 = ${digest}"
 
-      - name: Verify ELF is aarch64 static PIE with valid codesign
+      # 用上一步的 CODEX_BWRAP_SHA256 编其余 3 个 bin。code-mode-host 依赖 v8，
+      # 与 codex 一样是重编译；proxy 轻量。一次 cargo build 三个 --bin。
+      - name: Build codex + host + proxy (embedding bwrap digest)
+        working-directory: codex-rs
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-feature=+crt-static -C relocation-model=pic -C link-arg=-static-pie -C link-arg=-Wl,--code-sign -C link-arg=-Wl,--strip-debug -C link-arg=-Wl,--error-limit=0"
+        run: |
+          set -euo pipefail
+          test -n "${CODEX_BWRAP_SHA256:-}"   # 必须已由上一步注入
+          cargo build --target "$TARGET" --release \
+            --bin codex --bin codex-code-mode-host --bin codex-responses-api-proxy
+
+      - name: Verify all binaries are aarch64 static PIE with valid codesign
         working-directory: codex-rs
         run: |
           set -euo pipefail
-          BIN="target/${TARGET}/release/codex"
-          test -f "$BIN"
-          file "$BIN" || true
           READELF="$OHOS_NATIVE/llvm/bin/llvm-readelf"
-          # 必须是 ET_DYN（PIE）
-          "$READELF" -h "$BIN" | grep -q "DYN" \
-            || { echo "codex is not PIE (ET_DYN required by HarmonyOS PC)"; exit 1; }
-          # 必须无 INTERP（全静态）
-          if "$READELF" -l "$BIN" | grep -q INTERP; then
-            echo "codex has INTERP segment; not statically linked"; exit 1
-          fi
-          # .codesign 节必须存在
-          "$READELF" -S "$BIN" | grep -q codesign \
-            || { echo "codex has no .codesign section"; exit 1; }
-          # 复算 fs-verity Merkle 根哈希（拦截 lld 签名 bug）
           curl -fsSL -o /tmp/verify-codesign.py \
             https://raw.githubusercontent.com/jerry-271828/iperf/master/scripts/verify-codesign.py
-          python3 /tmp/verify-codesign.py "$BIN" | tee /dev/stderr | grep -q "MATCH: True" \
-            || { echo "code signature root hash is INVALID"; exit 1; }
-          echo "OK: aarch64 static-PIE, no INTERP, .codesign MATCH"
-          ls -la "$BIN"
+          for b in codex codex-code-mode-host codex-responses-api-proxy bwrap; do
+            BIN="target/${TARGET}/release/${b}"
+            test -f "$BIN" || { echo "missing binary: $b"; exit 1; }
+            echo "=== $b ==="
+            file "$BIN" || true
+            "$READELF" -h "$BIN" | grep -q "DYN" \
+              || { echo "$b is not PIE (ET_DYN required by HarmonyOS PC)"; exit 1; }
+            if "$READELF" -l "$BIN" | grep -q INTERP; then
+              echo "$b has INTERP segment; not statically linked"; exit 1
+            fi
+            "$READELF" -S "$BIN" | grep -q codesign \
+              || { echo "$b has no .codesign section"; exit 1; }
+            python3 /tmp/verify-codesign.py "$BIN" | tee /dev/stderr | grep -q "MATCH: True" \
+              || { echo "$b code signature root hash is INVALID"; exit 1; }
+            echo "OK: $b aarch64 static-PIE, no INTERP, .codesign MATCH"
+          done
 
-      - name: Stage artifact
+      # 按上游发布布局打包：codex 与 codex-code-mode-host 平级，bwrap 放
+      # codex-resources/（codex 运行时在 <exe_dir>/codex-resources/bwrap 找它）。
+      # codex-responses-api-proxy 作为独立二进制随包提供。
+      - name: Stage full release bundle
         run: |
           set -euo pipefail
-          mkdir -p dist
-          cp "codex-rs/target/${TARGET}/release/codex" dist/codex
-          sha256sum dist/codex | tee dist/codex.sha256
+          R="codex-rs/target/${TARGET}/release"
+          B="dist/codex-ohos-aarch64"
+          rm -rf dist && mkdir -p "$B/codex-resources"
+          cp "$R/codex"                       "$B/codex"
+          cp "$R/codex-code-mode-host"        "$B/codex-code-mode-host"
+          cp "$R/codex-responses-api-proxy"   "$B/codex-responses-api-proxy"
+          cp "$R/bwrap"                       "$B/codex-resources/bwrap"
+          chmod 0755 "$B/codex" "$B/codex-code-mode-host" \
+                     "$B/codex-responses-api-proxy" "$B/codex-resources/bwrap"
+          ( cd "$B" && sha256sum codex codex-code-mode-host \
+              codex-responses-api-proxy codex-resources/bwrap > SHA256SUMS )
+          echo "CODEX_BWRAP_SHA256 embedded = ${CODEX_BWRAP_SHA256}"
+          cat "$B/SHA256SUMS"
+          # 打一个可复现 tar 供整体分发
+          tar -C "$B" --sort=name --mtime='1970-01-01 00:00:00 UTC' \
+              --owner=0 --group=0 --numeric-owner \
+              -cf - codex codex-code-mode-host codex-responses-api-proxy codex-resources/bwrap \
+            | zstd -T0 -19 -o "dist/codex-ohos-aarch64-bundle.tar.zst"
+          ls -la "$B" "$B/codex-resources" dist
 
       - name: Write device instructions to summary
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
-          ## 设备侧使用（鸿蒙 PC）
+          ## 完整发布版（鸿蒙 PC，aarch64 static-PIE，链接期已签名）
 
-          产物已在链接期签名（`.codesign` 已嵌入），下载解压后直接：
-
+          artifact `codex-ohos-aarch64` 解压得到：
+          ```
+          codex                         # 主程序
+          codex-code-mode-host          # code-mode/v8 运行时子进程
+          codex-responses-api-proxy     # responses API 代理
+          codex-resources/bwrap         # 沙箱助手（codex 按摘要校验）
+          ```
+          安装（保持 codex 与 codex-resources/ 的相对布局）：
           ```sh
-          chmod +x codex
+          chmod +x codex codex-code-mode-host codex-responses-api-proxy codex-resources/bwrap
           ./codex --version
           ```
-
-          若内核仍拒绝执行（EPERM），设备端重签兜底：
-          `binary-sign-tool sign -inFile codex -outFile codex -selfSign 1`
+          若内核拒绝执行（EPERM）：`binary-sign-tool sign -inFile <bin> -outFile <bin> -selfSign 1`
           EOF
 
       - uses: actions/upload-artifact@v4
