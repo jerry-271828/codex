@@ -2,20 +2,26 @@ name: Build codex for HarmonyOS PC (aarch64 musl, static-PIE)
 
 # 为鸿蒙 PC（OpenHarmony / HarmonyOS PC，arm64_ohos）构建 codex CLI。
 #
-# 背景（见 harmonybrew 适配经验）：
-#   * codex 硬依赖 v8（code-mode 运行时），rusty_v8 官方无 OHOS 预编译库，
-#     但 openai/codex 自己的 CI 构建了 aarch64-unknown-linux-musl 版 librusty_v8，
-#     发布在 openai/codex 的 rusty-v8-v<ver> release 里。全静态 musl 二进制
-#     不依赖任何动态库/ohos loader，可直接在鸿蒙 PC 上跑。
-#   * 鸿蒙 PC 内核对 execve 强制校验代码签名，且只放行 PIE（ET_DYN）。
-#     因此这里用 -static-pie 产出全静态的 PIE；.codesign 签名在设备侧用
-#     binary-sign-tool 自签补上（GitHub 无 OHOS lld，无法链接期签名；
-#     musl 目标也用不了 OHOS 的 --code-sign）。
-#   * 复用上游两份现成资产，避免重复造轮子：
-#       .github/actions/setup-rusty-v8      —— 下载并校验 musl 版 librusty_v8
-#       .github/scripts/install-musl-build-tools.sh —— zig cc + libcap + aws-lc 环境
+# 方案：musl 编译 + OHOS musl 链接（混合）
+#   * 编译阶段用 aarch64-unknown-linux-musl：openai 官方 CI 自产 musl 版
+#     librusty_v8（rusty-v8-v<ver> release），aws-lc 等 C 依赖用 zig 交叉编译。
+#   * 链接阶段换 OHOS SDK 的 clang + OHOS sysroot：
+#       - vanilla musl 的启动代码在 HongMeng 内核上崩（实测 __init_libc
+#         解析初始栈 SIGSEGV）；OHOS musl 是华为适配版。链接器包装脚本
+#         过滤 rustc 传入的 rust 自带（vanilla musl）crt 对象 / -nostartfiles /
+#         self-contained 库路径，让 OHOS clang 驱动注入 OHOS 的
+#         rcrt1.o/crti.o/libc.a。
+#       - OHOS lld 的 -Wl,--code-sign 在链接期直接嵌入 .codesign 签名，
+#         产物落地即可执行（无需设备端 binary-sign-tool 补签）。
+#       - SDK 必须 ≥7.0-Beta1：6.1 的 --code-sign 对 >512KB 签名数据算错
+#         Merkle 根哈希；verify-codesign.py 步骤兜底拦截。
+#   * -static-pie：鸿蒙内核只放行 PIE（ET_DYN），全静态则免除 OHOS 动态
+#     loader 与 SDK/设备 libc 版本偏差问题。
 #
-# 触发后到「Artifacts」下载 codex-ohos-aarch64，设备侧签名步骤见 job summary。
+# OHOS SDK 从 jerry-271828/iperf 的 ci-toolchain-7.0-Beta1 release 镜像拉取
+# （GitHub 内网秒下；直连华为云 CDN 可能 1 小时+）。
+#
+# 产物已签名：下载 artifact 后 chmod +x 直接运行。
 
 on:
   workflow_dispatch:
@@ -25,13 +31,18 @@ on:
 permissions:
   contents: read
 
+env:
+  TARGET: aarch64-unknown-linux-musl
+  OHOS_SDK_RELEASE: 7.0-Beta1
+  OHOS_NATIVE_ZIP: native-linux-x64-26.0.0.25-Beta.zip
+  OHOS_NATIVE_SHA256: bf5000a934746794842baff28d01bc0ad59cb89a92c74f0346b70c9a65d58ab8
+  OHOS_SDK_MIRROR: https://github.com/jerry-271828/iperf/releases/download/ci-toolchain-7.0-Beta1
+
 jobs:
   build:
-    # GitHub 托管的公共 arm64 runner：目标即宿主架构，musl 交叉工具链由
-    # install-musl-build-tools.sh 用 zig 提供，无需自托管 arm64 runner。
-    runs-on: ubuntu-24.04-arm
-    env:
-      TARGET: aarch64-unknown-linux-musl
+    # 必须 x64：OHOS SDK 只发布 linux-x64 宿主的 llvm 工具链（lld 要在
+    # 宿主上跑）。C 依赖交叉编译由 zig 完成，与宿主架构无关。
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v5
@@ -57,23 +68,34 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             codex-rs/target
-          key: ohos-cargo-${{ hashFiles('codex-rs/Cargo.lock') }}
-          restore-keys: ohos-cargo-
+          key: ohos-cargo-v3-${{ hashFiles('codex-rs/Cargo.lock') }}
+          restore-keys: |
+            ohos-cargo-v3-
+            ohos-cargo-
 
-      # install-musl-build-tools.sh 依赖 zig 作为 C/C++ 编译器（zigcc/zigcxx）
-      # 来编译 aws-lc / boringssl 的汇编。缺了它脚本会退回系统 gcc，而脚本又
-      # 无条件给 aarch64 目标加了 clang 专用的 -Wno-error=frame-larger-than，
-      # gcc 的 cc1 不认识 → aws-lc 每个 .S 都编译失败。必须先装 zig（与上游
-      # rust-release.yml 完全一致的 pin）。
+      # zig 为 install-musl-build-tools.sh 提供 clang 系 C/C++ 交叉编译器；
+      # 缺了它脚本退回 gcc 且带 clang 专用 flag，aws-lc 汇编全炸（第 1 轮教训）。
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.14.0
           use-cache: false
 
-      # 上游脚本：用 zigcc/zigcxx 交叉编译 aws-lc / boringssl 等原生依赖到 musl，
-      # 构建 libcap.a，并写入一大批 CC_/CXX_/CARGO_TARGET_*_LINKER 等环境变量
-      # 到 $GITHUB_ENV。
+      # x64 宿主上没有 aarch64 musl gcc；伪造一个包装 zig 的同名命令，
+      # 让上游脚本用它编 libcap.a（最终链接器稍后覆盖成 OHOS clang）。
+      - name: Provide aarch64-linux-musl-gcc shim (zig)
+        run: |
+          set -euo pipefail
+          zig_bin="$(command -v zig)"
+          sudo tee /usr/local/bin/aarch64-linux-musl-gcc >/dev/null <<EOF
+          #!/usr/bin/env bash
+          exec "${zig_bin}" cc -target aarch64-linux-musl "\$@"
+          EOF
+          sudo chmod +x /usr/local/bin/aarch64-linux-musl-gcc
+          aarch64-linux-musl-gcc --version | head -1
+
+      # 上游脚本：zigcc/zigcxx 交叉编译 aws-lc / boringssl 等原生依赖到 musl，
+      # 构建 libcap.a，写入 CC_/CXX_/CARGO_TARGET_*_LINKER 等到 $GITHUB_ENV。
       - name: Install musl build tools (zig cross toolchain)
         run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
 
@@ -84,42 +106,129 @@ jobs:
           echo "AWS_LC_SYS_NO_JITTER_ENTROPY=1" >> "$GITHUB_ENV"
           echo "AWS_LC_SYS_NO_JITTER_ENTROPY_aarch64_unknown_linux_musl=1" >> "$GITHUB_ENV"
 
-      # 上游 composite action：解析 Cargo.toml 里钉的 v8 版本，从 openai/codex
-      # 的 rusty-v8-v<ver> release 下载 librusty_v8_release_<target>.a.gz +
-      # src_binding，校验 sha256，导出 RUSTY_V8_ARCHIVE / RUSTY_V8_SRC_BINDING_PATH。
+      - name: Restore OHOS native toolchain cache
+        id: sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/ohos-native
+          key: ohos-native-linux-x64-${{ env.OHOS_SDK_RELEASE }}
+
+      - name: Download OHOS native toolchain (GitHub mirror)
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 3 -o "$RUNNER_TEMP/native-linux.zip" \
+            "${OHOS_SDK_MIRROR}/${OHOS_NATIVE_ZIP}"
+          echo "${OHOS_NATIVE_SHA256}  $RUNNER_TEMP/native-linux.zip" | sha256sum -c -
+          mkdir -p ~/ohos-native
+          unzip -q "$RUNNER_TEMP/native-linux.zip" -d ~/ohos-native
+          rm -f "$RUNNER_TEMP/native-linux.zip"
+
+      # 最终链接器：OHOS clang + OHOS musl sysroot。包装脚本过滤：
+      #   - 裸 -static（与 -static-pie 冲突；rustc 因 crt-static 传入）
+      #   - -nostartfiles（rustc 用它压制驱动默认 crt，好塞它自带的
+      #     vanilla musl crt——我们恰恰要驱动注入 OHOS crt）
+      #   - */self-contained/*crt*.o（rust 自带 vanilla musl 的
+      #     crt1/rcrt1/crti/crtn 对象）
+      #   - -L */self-contained*（防止 -lc 解析到 rust 自带 vanilla musl libc.a）
+      # 探测 lld 支持 --code-sign 再放行。
+      - name: Set up OHOS linker (overrides musl gcc)
+        run: |
+          set -euxo pipefail
+          NATIVE="$HOME/ohos-native/native"
+          test -x "$NATIVE/llvm/bin/clang"
+          test -d "$NATIVE/sysroot"
+          if ! "$NATIVE/llvm/bin/ld.lld" --help | grep -- '--code-sign' >/dev/null; then
+            echo "This SDK's lld lacks --code-sign; use >= 7.0-Beta1" >&2; exit 1
+          fi
+          wrapper="$RUNNER_TEMP/ohos-link-clang"
+          cat > "$wrapper" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          args=()
+          skip_next=0
+          for a in "\$@"; do
+            if [[ "\$skip_next" -eq 1 ]]; then skip_next=0; continue; fi
+            case "\$a" in
+              -static|-nostartfiles) continue ;;
+              */self-contained/crt1.o|*/self-contained/rcrt1.o|*/self-contained/crti.o|*/self-contained/crtn.o|*/self-contained/Scrt1.o) continue ;;
+              -L)
+                # 两参形式 -L <dir>：偷看下一个参数
+                peek_next=1; args+=("-L_PLACEHOLDER_"); continue ;;
+              -L*/self-contained*) continue ;;
+            esac
+            args+=("\$a")
+          done
+          # 处理 -L 两参形式：把占位符与其后继配对过滤
+          final=()
+          drop_next=0
+          for a in "\${args[@]}"; do
+            if [[ "\$drop_next" -eq 1 ]]; then
+              drop_next=0
+              case "\$a" in
+                */self-contained*) continue ;;
+                *) final+=("-L" "\$a"); continue ;;
+              esac
+            fi
+            if [[ "\$a" == "-L_PLACEHOLDER_" ]]; then drop_next=1; continue; fi
+            final+=("\$a")
+          done
+          exec "$NATIVE/llvm/bin/clang" --target=aarch64-linux-ohos --sysroot="$NATIVE/sysroot" "\${final[@]}"
+          EOF
+          chmod +x "$wrapper"
+          # 冒烟：包装器能编译最小 C 程序为 static-pie
+          echo 'int main(){return 0;}' > "$RUNNER_TEMP/t.c"
+          "$wrapper" "$RUNNER_TEMP/t.c" -static-pie -Wl,--code-sign -o "$RUNNER_TEMP/t.out"
+          "$NATIVE/llvm/bin/llvm-readelf" -h "$RUNNER_TEMP/t.out" | grep -E 'Type:.*DYN'
+          "$NATIVE/llvm/bin/llvm-readelf" -S "$RUNNER_TEMP/t.out" | grep codesign
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$wrapper" >> "$GITHUB_ENV"
+          echo "OHOS_NATIVE=$NATIVE" >> "$GITHUB_ENV"
+
+      # 上游 composite action：从 openai/codex 的 rusty-v8-v<ver> release 下载
+      # musl 版 librusty_v8 + src_binding，校验 sha256，导出 RUSTY_V8_* 环境变量。
       - name: Configure rusty_v8 artifact overrides
         uses: ./.github/actions/setup-rusty-v8
         with:
           target: aarch64-unknown-linux-musl
 
-      # -static-pie：全静态 + PIE(ET_DYN)。鸿蒙 PC 只放行 PIE；普通 -static
-      # 产出 ET_EXEC，签名也会被 execve 以 EPERM 拒绝（本机已实测：EXEC 版
-      # 签名能过校验但一运行即 SIGSEGV）。static-pie 仍零动态依赖。
-      # relocation-model=pic 确保所有 crate 及 C 依赖按 PIC 编译。
-      - name: Cargo build codex (static-PIE)
+      # RUSTFLAGS 说明：
+      #   crt-static + relocation-model=pic + -static-pie → 全静态 PIE(ET_DYN)
+      #   -Wl,--code-sign → 链接期嵌入 .codesign（鸿蒙内核 execve 强制校验）
+      #   -Wl,--strip-debug → 链接期去 debug 段（链接后 strip 会毁签名，
+      #     必须在链接参数里做；否则产物 1.3GB）
+      #   -Wl,--error-limit=0 → 失败时打全错误便于迭代
+      - name: Cargo build codex (static-PIE, OHOS libc, signed)
         working-directory: codex-rs
         env:
-          RUSTFLAGS: "-C target-feature=+crt-static -C relocation-model=pic -C link-arg=-static-pie"
+          RUSTFLAGS: "-C target-feature=+crt-static -C relocation-model=pic -C link-arg=-static-pie -C link-arg=-Wl,--code-sign -C link-arg=-Wl,--strip-debug -C link-arg=-Wl,--error-limit=0"
         run: |
           set -euo pipefail
           cargo build --target "$TARGET" --release --bin codex
 
-      - name: Verify ELF is aarch64 static PIE
+      - name: Verify ELF is aarch64 static PIE with valid codesign
         working-directory: codex-rs
         run: |
           set -euo pipefail
           BIN="target/${TARGET}/release/codex"
           test -f "$BIN"
-          sudo apt-get install -y file >/dev/null 2>&1 || true
-          file "$BIN"
+          file "$BIN" || true
+          READELF="$OHOS_NATIVE/llvm/bin/llvm-readelf"
           # 必须是 ET_DYN（PIE）
-          readelf -h "$BIN" | grep -q "DYN" \
+          "$READELF" -h "$BIN" | grep -q "DYN" \
             || { echo "codex is not PIE (ET_DYN required by HarmonyOS PC)"; exit 1; }
-          # 必须无 INTERP（全静态）——否则设备上无 ohos musl loader 会跑不起来
-          if readelf -l "$BIN" | grep -q INTERP; then
+          # 必须无 INTERP（全静态）
+          if "$READELF" -l "$BIN" | grep -q INTERP; then
             echo "codex has INTERP segment; not statically linked"; exit 1
           fi
-          echo "OK: aarch64 static-PIE, no INTERP"
+          # .codesign 节必须存在
+          "$READELF" -S "$BIN" | grep -q codesign \
+            || { echo "codex has no .codesign section"; exit 1; }
+          # 复算 fs-verity Merkle 根哈希（拦截 lld 签名 bug）
+          curl -fsSL -o /tmp/verify-codesign.py \
+            https://raw.githubusercontent.com/jerry-271828/iperf/master/scripts/verify-codesign.py
+          python3 /tmp/verify-codesign.py "$BIN" | tee /dev/stderr | grep -q "MATCH: True" \
+            || { echo "code signature root hash is INVALID"; exit 1; }
+          echo "OK: aarch64 static-PIE, no INTERP, .codesign MATCH"
           ls -la "$BIN"
 
       - name: Stage artifact
@@ -129,22 +238,20 @@ jobs:
           cp "codex-rs/target/${TARGET}/release/codex" dist/codex
           sha256sum dist/codex | tee dist/codex.sha256
 
-      - name: Write device-side signing instructions to summary
+      - name: Write device instructions to summary
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
-          ## 设备侧签名（鸿蒙 PC 上执行一次）
+          ## 设备侧使用（鸿蒙 PC）
 
-          下载 artifact 解压得到 `codex` 后，在鸿蒙 PC 终端：
+          产物已在链接期签名（`.codesign` 已嵌入），下载解压后直接：
 
           ```sh
-          # 放到可执行分区（/storage 下的用户目录即可，/data/local/tmp 被 noexec 拦）
           chmod +x codex
-          # 自签名：追加 .codesign 节，过内核代码签名校验
-          binary-sign-tool sign -inFile codex -outFile codex -selfSign 1
-          # 校验根哈希正确
-          python3 ~/.claude/skills/harmonybrew/scripts/verify-codesign.py codex   # 期望 MATCH: True
           ./codex --version
           ```
+
+          若内核仍拒绝执行（EPERM），设备端重签兜底：
+          `binary-sign-tool sign -inFile codex -outFile codex -selfSign 1`
           EOF
 
       - uses: actions/upload-artifact@v4
