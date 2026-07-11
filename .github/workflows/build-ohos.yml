@@ -204,16 +204,22 @@ jobs:
             echo "This SDK's lld lacks --code-sign; use >= 7.0-Beta1" >&2; exit 1
           fi
           # 定位提供 __emutls_get_address 的静态库。背景:zig cc 对 musl target
-          # 强制 emulated-TLS(-fno-emulated-tls 无效,实测忽略),zig 编译的
-          # libcap.a 引用 __emutls_get_address;我们链接 -nodefaultlibs,须显式
-          # 提供。OHOS SDK 的 libclang_rt.builtins.a 没编 emutls(OHOS 全 native
-          # TLS,实测缺该符号);改用 Ubuntu gcc-aarch64-linux-gnu 交叉包的
-          # libgcc.a——gcc 对 linux target 必含 emutls,且 clang 的 emutls ABI
-          # 就是按 gcc 兼容设计的;emutls 仅调 pthread_key_*/malloc 等跨 libc
-          # 稳定接口,与 OHOS musl 链接安全。
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu >/dev/null
-          RTLIB="$(aarch64-linux-gnu-gcc -print-libgcc-file-name)"
-          test -f "$RTLIB" || { echo "cannot locate cross libgcc.a"; exit 1; }
+          # 强制 emulated-TLS(-fno-emulated-tls 无效),zig 编译的 libcap.a 引用
+          # __emutls_get_address;我们链接 -nodefaultlibs,须显式提供。
+          # 实测排除:OHOS SDK 的 libclang_rt.builtins.a 没编 emutls(OHOS 全
+          # native TLS);Ubuntu gcc-cross 的 libgcc.a 也没有(gcc 只给无 native
+          # TLS 的目标编 emutls,aarch64-linux 不在其列)。
+          # 唯一保证匹配的来源:zig 自己的 compiler_rt(zig 强制 emutls,必自带
+          # 运行时 emutls.zig;生成调用与提供运行时是同一工具链,ABI 必配)。
+          # 做法:独立缓存目录里让 zig 哑链接一次,从缓存挖出 libcompiler_rt.a。
+          rtcache="$RUNNER_TEMP/zig-rt-cache"
+          rm -rf "$rtcache"; mkdir -p "$rtcache"
+          echo 'int main(){return 0;}' > "$RUNNER_TEMP/d.c"
+          ZIG_GLOBAL_CACHE_DIR="$rtcache" ZIG_LOCAL_CACHE_DIR="$rtcache" \
+            zig cc -target aarch64-linux-musl "$RUNNER_TEMP/d.c" -o "$RUNNER_TEMP/d.out"
+          RTLIB="$(find "$rtcache" \( -name 'libcompiler_rt.a' -o -name 'compiler_rt.o' \) -type f 2>/dev/null | head -1)"
+          test -n "$RTLIB" && test -f "$RTLIB" \
+            || { echo "cannot extract zig compiler_rt from cache"; find "$rtcache" -name '*.a' -o -name '*.o' | head; exit 1; }
           echo "emutls provider = $RTLIB"
           wrapper="$RUNNER_TEMP/ohos-link-clang"
           cat > "$wrapper" <<EOF
