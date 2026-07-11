@@ -96,7 +96,13 @@ jobs:
 
       # 上游脚本：zigcc/zigcxx 交叉编译 aws-lc / boringssl 等原生依赖到 musl，
       # 构建 libcap.a，写入 CC_/CXX_/CARGO_TARGET_*_LINKER 等到 $GITHUB_ENV。
+      # BUILD_CC=cc：libcap 的 _makenames 是构建期工具，必须用宿主(x64) cc 编，
+      # 否则被 aarch64 shim 编成 arm64 → "Exec format error"（上游脚本原本
+      # 跑在 arm64 runner 上宿主==目标，没暴露这个问题）。libcap Make.Rules
+      # 的 BUILD_CC ?= $(CC) 尊重环境变量。
       - name: Install musl build tools (zig cross toolchain)
+        env:
+          BUILD_CC: cc
         run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
 
       # 见上游 rust-release.yml：musl 上 aws-lc 的 jitter entropy 路径有问题，关掉。
