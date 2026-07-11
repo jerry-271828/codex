@@ -125,12 +125,10 @@ jobs:
       # aarch64 目标编译改由 target-suffixed 变量承载：
       #   CC_aarch64_unknown_linux_musl（上游已写）+ 这里补写的
       #   CFLAGS_aarch64_unknown_linux_musl（把 aws-lc/boringssl 在 clang 下需要
-      #   的 -pthread -Wno-error=frame-larger-than 只给 target；另加
-      #   -fno-emulated-tls：bwrap 的 vendored bubblewrap C 用 thread_local，
-      #   zigcc 默认对该 target 生成 emulated-TLS 调用 __emutls_get_address，
-      #   而该符号由 compiler-rt 提供，但我们链接 -nodefaultlibs 只留 rust 的
-      #   libcompiler_builtins（不含 emutls）→ undefined symbol。改用 aarch64
-      #   native ELF TLS 从源头消除该符号引用）。
+      #   的 -pthread -Wno-error=frame-larger-than 只给 target）。
+      #   （注：bwrap 的 emulated-TLS 问题不在这里解决——zig 对 musl 强制 emutls，
+      #   -fno-emulated-tls 无效；改由链接器包装脚本追加 OHOS compiler-rt 提供
+      #   __emutls_get_address，见 "Set up OHOS linker" 步骤。）
       #   cc-rs 变量优先级：<VAR>_<target> > TARGET_<VAR> > <VAR>，故 target
       #   编译用 zigcc + 上述 CFLAGS，host 编译用干净的 cc + 空 CFLAGS，互不干扰。
       - name: Isolate host/target C compiler env
@@ -143,8 +141,8 @@ jobs:
             echo "CXXFLAGS="
             echo "CMAKE_C_COMPILER=cc"
             echo "CMAKE_CXX_COMPILER=c++"
-            echo "CFLAGS_aarch64_unknown_linux_musl=-pthread -Wno-error=frame-larger-than -fno-emulated-tls"
-            echo "CXXFLAGS_aarch64_unknown_linux_musl=-pthread -Wno-error=frame-larger-than -fno-emulated-tls"
+            echo "CFLAGS_aarch64_unknown_linux_musl=-pthread -Wno-error=frame-larger-than"
+            echo "CXXFLAGS_aarch64_unknown_linux_musl=-pthread -Wno-error=frame-larger-than"
           } >> "$GITHUB_ENV"
 
       # 见上游 rust-release.yml：musl 上 aws-lc 的 jitter entropy 路径有问题，关掉。
@@ -192,6 +190,20 @@ jobs:
           if ! "$NATIVE/llvm/bin/ld.lld" --help | grep -- '--code-sign' >/dev/null; then
             echo "This SDK's lld lacks --code-sign; use >= 7.0-Beta1" >&2; exit 1
           fi
+          # 定位 OHOS SDK 自带的 compiler-rt builtins 静态库。bwrap 的 vendored
+          # bubblewrap C 用 thread_local，zig cc 对 musl target 强制 emulated-TLS
+          # （-fno-emulated-tls 无效，实测 zig 忽略），生成对 __emutls_get_address
+          # 的引用；该符号由 compiler-rt 提供。我们链接 -nodefaultlibs，故需把这个
+          # builtins 归档显式加到链接末尾。纯 Rust 的 codex/host/proxy 不引用它，
+          # 加了也无害（未用符号不会被拉入）。
+          RTLIB="$("$NATIVE/llvm/bin/clang" --target=aarch64-linux-ohos \
+            -print-libgcc-file-name 2>/dev/null || true)"
+          if [[ -z "$RTLIB" || ! -f "$RTLIB" ]]; then
+            RTLIB="$(find "$NATIVE/llvm/lib/clang" -name 'libclang_rt.builtins*.a' 2>/dev/null | grep -iE 'aarch64|arm64' | head -1 || true)"
+          fi
+          test -n "$RTLIB" && test -f "$RTLIB" \
+            || { echo "cannot locate OHOS compiler-rt builtins archive"; exit 1; }
+          echo "compiler-rt builtins = $RTLIB"
           wrapper="$RUNNER_TEMP/ohos-link-clang"
           cat > "$wrapper" <<EOF
           #!/usr/bin/env bash
@@ -215,15 +227,22 @@ jobs:
             esac
             args+=("\$a")
           done
-          exec "$NATIVE/llvm/bin/clang" --target=aarch64-linux-ohos --sysroot="$NATIVE/sysroot" "\${args[@]}"
+          # compiler-rt builtins 放最后：提供 bubblewrap emutls 的
+          # __emutls_get_address 等符号；未引用的 builtins 不会被拉入。
+          exec "$NATIVE/llvm/bin/clang" --target=aarch64-linux-ohos --sysroot="$NATIVE/sysroot" "\${args[@]}" "$RTLIB"
           EOF
           chmod +x "$wrapper"
-          # 冒烟：包装器能把最小 C 程序链成 static-pie + 签名（模拟 rustc 会传的
-          # 冲突参数 -static -no-pie，确认被正确过滤）
+          # 冒烟 1：包装器能把最小 C 程序链成 static-pie + 签名（模拟 rustc 会传的
+          # 冲突参数 -static -no-pie，确认被正确过滤）。
           echo 'int main(){return 0;}' > "$RUNNER_TEMP/t.c"
           "$wrapper" "$RUNNER_TEMP/t.c" -static -no-pie -static-pie -Wl,--code-sign -o "$RUNNER_TEMP/t.out"
           "$NATIVE/llvm/bin/llvm-readelf" -h "$RUNNER_TEMP/t.out" | grep -E 'Type:.*DYN'
           "$NATIVE/llvm/bin/llvm-readelf" -S "$RUNNER_TEMP/t.out" | grep codesign
+          # 冒烟 2：确认选中的 compiler-rt 归档确实提供 __emutls_get_address
+          # （定位错归档就早失败，不拖到 bwrap 链接期）。
+          "$NATIVE/llvm/bin/llvm-nm" "$RTLIB" 2>/dev/null | grep -q 'T __emutls_get_address' \
+            || { echo "selected compiler-rt archive lacks __emutls_get_address: $RTLIB"; exit 1; }
+          echo "compiler-rt provides __emutls_get_address: OK"
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$wrapper" >> "$GITHUB_ENV"
           echo "OHOS_NATIVE=$NATIVE" >> "$GITHUB_ENV"
 
@@ -255,20 +274,13 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-feature=+crt-static -C relocation-model=pic -C link-arg=-static-pie -C link-arg=-Wl,--code-sign -C link-arg=-Wl,--strip-debug -C link-arg=-Wl,--error-limit=0"
         run: |
           set -euo pipefail
-          # 强制重编 bwrap 的 build-script 与 vendored C：cargo/cc-rs 不会因
-          # CFLAGS 环境变量变化而让 C 对象缓存失效，上一轮缓存的 bubblewrap .o
-          # 仍带 emutls 调用。用 cargo clean -p 精准清掉 bwrap 包的产物，确保
-          # 新的 -fno-emulated-tls 生效。
-          cargo clean -p codex-bwrap --target "$TARGET" --release || true
           cargo build --target "$TARGET" --release --bin bwrap
           BW="target/${TARGET}/release/bwrap"
           test -f "$BW"
-          # 确认符号已消除（早失败早报错，胜过链接期）
-          if "$OHOS_NATIVE/llvm/bin/llvm-nm" "$BW" 2>/dev/null | grep -q '__emutls_get_address'; then
-            echo "still references __emutls_get_address"; exit 1
-          fi
           # bwrap 已是链接期 strip+签名的最终字节，直接对其算摘要（不能再 strip，
-          # 否则毁签名且改变字节使摘要与打包内容不符）。
+          # 否则毁签名且改变字节使摘要与打包内容不符）。__emutls_get_address 由
+          # 链接器包装脚本追加的 OHOS compiler-rt 提供（zig 对 musl 强制 emutls，
+          # -fno-emulated-tls 无效，故走 compiler-rt 方案）。
           digest="$(sha256sum "$BW" | awk '{print $1}')"
           echo "CODEX_BWRAP_SHA256=${digest}" >> "$GITHUB_ENV"
           echo "bwrap sha256 = ${digest}"
