@@ -205,7 +205,11 @@ jobs:
         with:
           target: aarch64-unknown-linux-musl
 
-      # RUSTFLAGS 说明：
+      # RUSTFLAGS 说明（必须用 CARGO_TARGET_<triple>_RUSTFLAGS 而非全局
+      # RUSTFLAGS：proc-macro / build-script 为构建宿主 x64 编译并在编译期运行，
+      # 全局 RUSTFLAGS 会把 -static-pie/--code-sign/OHOS 链接器也加到宿主编译上，
+      # 导致 x64 的 proc-macro 去链接 aarch64 标志 → incompatible with
+      # elf64-x86-64。target-specific 变量只作用于 aarch64 目标 crate）：
       #   crt-static + relocation-model=pic + -static-pie → 全静态 PIE(ET_DYN)
       #   -Wl,--code-sign → 链接期嵌入 .codesign（鸿蒙内核 execve 强制校验）
       #   -Wl,--strip-debug → 链接期去 debug 段（链接后 strip 会毁签名，
@@ -214,7 +218,7 @@ jobs:
       - name: Cargo build codex (static-PIE, OHOS libc, signed)
         working-directory: codex-rs
         env:
-          RUSTFLAGS: "-C target-feature=+crt-static -C relocation-model=pic -C link-arg=-static-pie -C link-arg=-Wl,--code-sign -C link-arg=-Wl,--strip-debug -C link-arg=-Wl,--error-limit=0"
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-feature=+crt-static -C relocation-model=pic -C link-arg=-static-pie -C link-arg=-Wl,--code-sign -C link-arg=-Wl,--strip-debug -C link-arg=-Wl,--error-limit=0"
         run: |
           set -euo pipefail
           cargo build --target "$TARGET" --release --bin codex
