@@ -190,20 +190,18 @@ jobs:
           if ! "$NATIVE/llvm/bin/ld.lld" --help | grep -- '--code-sign' >/dev/null; then
             echo "This SDK's lld lacks --code-sign; use >= 7.0-Beta1" >&2; exit 1
           fi
-          # 定位 OHOS SDK 自带的 compiler-rt builtins 静态库。bwrap 的 vendored
-          # bubblewrap C 用 thread_local，zig cc 对 musl target 强制 emulated-TLS
-          # （-fno-emulated-tls 无效，实测 zig 忽略），生成对 __emutls_get_address
-          # 的引用；该符号由 compiler-rt 提供。我们链接 -nodefaultlibs，故需把这个
-          # builtins 归档显式加到链接末尾。纯 Rust 的 codex/host/proxy 不引用它，
-          # 加了也无害（未用符号不会被拉入）。
-          RTLIB="$("$NATIVE/llvm/bin/clang" --target=aarch64-linux-ohos \
-            -print-libgcc-file-name 2>/dev/null || true)"
-          if [[ -z "$RTLIB" || ! -f "$RTLIB" ]]; then
-            RTLIB="$(find "$NATIVE/llvm/lib/clang" -name 'libclang_rt.builtins*.a' 2>/dev/null | grep -iE 'aarch64|arm64' | head -1 || true)"
-          fi
-          test -n "$RTLIB" && test -f "$RTLIB" \
-            || { echo "cannot locate OHOS compiler-rt builtins archive"; exit 1; }
-          echo "compiler-rt builtins = $RTLIB"
+          # 定位提供 __emutls_get_address 的静态库。背景:zig cc 对 musl target
+          # 强制 emulated-TLS(-fno-emulated-tls 无效,实测忽略),zig 编译的
+          # libcap.a 引用 __emutls_get_address;我们链接 -nodefaultlibs,须显式
+          # 提供。OHOS SDK 的 libclang_rt.builtins.a 没编 emutls(OHOS 全 native
+          # TLS,实测缺该符号);改用 Ubuntu gcc-aarch64-linux-gnu 交叉包的
+          # libgcc.a——gcc 对 linux target 必含 emutls,且 clang 的 emutls ABI
+          # 就是按 gcc 兼容设计的;emutls 仅调 pthread_key_*/malloc 等跨 libc
+          # 稳定接口,与 OHOS musl 链接安全。
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu >/dev/null
+          RTLIB="$(aarch64-linux-gnu-gcc -print-libgcc-file-name)"
+          test -f "$RTLIB" || { echo "cannot locate cross libgcc.a"; exit 1; }
+          echo "emutls provider = $RTLIB"
           wrapper="$RUNNER_TEMP/ohos-link-clang"
           cat > "$wrapper" <<EOF
           #!/usr/bin/env bash
@@ -227,9 +225,11 @@ jobs:
             esac
             args+=("\$a")
           done
-          # compiler-rt builtins 放最后：提供 bubblewrap emutls 的
-          # __emutls_get_address 等符号；未引用的 builtins 不会被拉入。
-          exec "$NATIVE/llvm/bin/clang" --target=aarch64-linux-ohos --sysroot="$NATIVE/sysroot" "\${args[@]}" "$RTLIB"
+          # libgcc.a 放最后提供 __emutls_get_address(zig 编译的 libcap 引用);
+          # 其后再补一次 -lc:emutls 需要 pthread_key_*/malloc,归档从左到右
+          # 解析,避免 libc.a 成员未被拉入的顺序问题。未引用的成员不会进产物,
+          # 纯 Rust 的 codex/host/proxy 不受影响。
+          exec "$NATIVE/llvm/bin/clang" --target=aarch64-linux-ohos --sysroot="$NATIVE/sysroot" "\${args[@]}" "$RTLIB" -lc
           EOF
           chmod +x "$wrapper"
           # 冒烟 1：包装器能把最小 C 程序链成 static-pie + 签名（模拟 rustc 会传的
@@ -238,11 +238,11 @@ jobs:
           "$wrapper" "$RUNNER_TEMP/t.c" -static -no-pie -static-pie -Wl,--code-sign -o "$RUNNER_TEMP/t.out"
           "$NATIVE/llvm/bin/llvm-readelf" -h "$RUNNER_TEMP/t.out" | grep -E 'Type:.*DYN'
           "$NATIVE/llvm/bin/llvm-readelf" -S "$RUNNER_TEMP/t.out" | grep codesign
-          # 冒烟 2：确认选中的 compiler-rt 归档确实提供 __emutls_get_address
-          # （定位错归档就早失败，不拖到 bwrap 链接期）。
-          "$NATIVE/llvm/bin/llvm-nm" "$RTLIB" 2>/dev/null | grep -q 'T __emutls_get_address' \
-            || { echo "selected compiler-rt archive lacks __emutls_get_address: $RTLIB"; exit 1; }
-          echo "compiler-rt provides __emutls_get_address: OK"
+          # 冒烟 2：确认选中的归档确实提供 __emutls_get_address（定义符号，
+          # T=text 或 W=weak），定位错就早失败，不拖到 bwrap 链接期。
+          "$NATIVE/llvm/bin/llvm-nm" "$RTLIB" 2>/dev/null | grep -qE ' [TW] __emutls_get_address' \
+            || { echo "selected archive lacks __emutls_get_address: $RTLIB"; exit 1; }
+          echo "emutls provider exports __emutls_get_address: OK"
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$wrapper" >> "$GITHUB_ENV"
           echo "OHOS_NATIVE=$NATIVE" >> "$GITHUB_ENV"
 
