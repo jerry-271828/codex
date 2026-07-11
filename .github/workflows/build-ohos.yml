@@ -167,13 +167,16 @@ jobs:
           unzip -q "$RUNNER_TEMP/native-linux.zip" -d ~/ohos-native
           rm -f "$RUNNER_TEMP/native-linux.zip"
 
-      # 最终链接器：OHOS clang + OHOS musl sysroot。包装脚本过滤：
-      #   - 裸 -static（与 -static-pie 冲突；rustc 因 crt-static 传入）
-      #   - -nostartfiles（rustc 用它压制驱动默认 crt，好塞它自带的
-      #     vanilla musl crt——我们恰恰要驱动注入 OHOS crt）
-      #   - */self-contained/*crt*.o（rust 自带 vanilla musl 的
-      #     crt1/rcrt1/crti/crtn 对象）
-      #   - -L */self-contained*（防止 -lc 解析到 rust 自带 vanilla musl libc.a）
+      # 最终链接器：OHOS clang + OHOS musl sysroot。包装脚本过滤 rustc 为 musl
+      # 目标默认传入、与我们 -static-pie + OHOS libc 冲突的参数：
+      #   - -static 和 -no-pie：rustc 因 crt-static 默认想产 ET_EXEC，与
+      #     -static-pie 冲突（clang: "cannot specify 'nopie' along with
+      #     'static-pie'"）。全部丢弃，只留我们的 -static-pie。
+      #   - -nostartfiles：rustc 用它压制驱动默认 crt 以塞自带 vanilla musl crt；
+      #     我们要让 OHOS clang 驱动注入 OHOS 的 crt，故丢弃。
+      #   - */self-contained/*.o：rust 自带 vanilla musl 的 crt1/crti/crtbegin/
+      #     crtend/crtn 等对象，全部丢弃（含 crtbegin/crtend，不只 crt1/crti）。
+      #   - -L */self-contained*：防止 -lc/-lunwind 解析到 rust 的 vanilla musl。
       # 探测 lld 支持 --code-sign 再放行。
       - name: Set up OHOS linker (overrides musl gcc)
         run: |
@@ -189,39 +192,31 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
           args=()
-          skip_next=0
-          for a in "\$@"; do
-            if [[ "\$skip_next" -eq 1 ]]; then skip_next=0; continue; fi
-            case "\$a" in
-              -static|-nostartfiles) continue ;;
-              */self-contained/crt1.o|*/self-contained/rcrt1.o|*/self-contained/crti.o|*/self-contained/crtn.o|*/self-contained/Scrt1.o) continue ;;
-              -L)
-                # 两参形式 -L <dir>：偷看下一个参数
-                peek_next=1; args+=("-L_PLACEHOLDER_"); continue ;;
-              -L*/self-contained*) continue ;;
-            esac
-            args+=("\$a")
-          done
-          # 处理 -L 两参形式：把占位符与其后继配对过滤
-          final=()
           drop_next=0
-          for a in "\${args[@]}"; do
+          for a in "\$@"; do
             if [[ "\$drop_next" -eq 1 ]]; then
               drop_next=0
               case "\$a" in
-                */self-contained*) continue ;;
-                *) final+=("-L" "\$a"); continue ;;
+                */self-contained*) continue ;;   # -L <dir> 指向 self-contained：连值丢弃
+                *) args+=("-L" "\$a"); continue ;;
               esac
             fi
-            if [[ "\$a" == "-L_PLACEHOLDER_" ]]; then drop_next=1; continue; fi
-            final+=("\$a")
+            case "\$a" in
+              -static|-no-pie|-nopie|-nostartfiles) continue ;;
+              */self-contained/*.o) continue ;;   # 所有 rust 自带 vanilla musl crt 对象
+              -L)
+                drop_next=1; continue ;;           # -L <dir> 两参形式：暂存，下一轮判定
+              -L*/self-contained*) continue ;;     # -L<dir> 单参形式
+            esac
+            args+=("\$a")
           done
-          exec "$NATIVE/llvm/bin/clang" --target=aarch64-linux-ohos --sysroot="$NATIVE/sysroot" "\${final[@]}"
+          exec "$NATIVE/llvm/bin/clang" --target=aarch64-linux-ohos --sysroot="$NATIVE/sysroot" "\${args[@]}"
           EOF
           chmod +x "$wrapper"
-          # 冒烟：包装器能编译最小 C 程序为 static-pie
+          # 冒烟：包装器能把最小 C 程序链成 static-pie + 签名（模拟 rustc 会传的
+          # 冲突参数 -static -no-pie，确认被正确过滤）
           echo 'int main(){return 0;}' > "$RUNNER_TEMP/t.c"
-          "$wrapper" "$RUNNER_TEMP/t.c" -static-pie -Wl,--code-sign -o "$RUNNER_TEMP/t.out"
+          "$wrapper" "$RUNNER_TEMP/t.c" -static -no-pie -static-pie -Wl,--code-sign -o "$RUNNER_TEMP/t.out"
           "$NATIVE/llvm/bin/llvm-readelf" -h "$RUNNER_TEMP/t.out" | grep -E 'Type:.*DYN'
           "$NATIVE/llvm/bin/llvm-readelf" -S "$RUNNER_TEMP/t.out" | grep codesign
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$wrapper" >> "$GITHUB_ENV"
