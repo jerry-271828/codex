@@ -94,15 +94,41 @@ jobs:
           version: 0.14.0
           use-cache: false
 
-      # x64 宿主上没有 aarch64 musl gcc；伪造一个包装 zig 的同名命令，
-      # 让上游脚本用它编 libcap.a（最终链接器稍后覆盖成 OHOS clang）。
-      - name: Provide aarch64-linux-musl-gcc shim (zig)
+      # SDK 提前到 shim 之前下载：libcap 的 shim 要用 OHOS clang（见下步）。
+      - name: Restore OHOS native toolchain cache
+        id: sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/ohos-native
+          key: ohos-native-linux-x64-${{ env.OHOS_SDK_RELEASE }}
+
+      - name: Download OHOS native toolchain (GitHub mirror)
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 3 -o "$RUNNER_TEMP/native-linux.zip" \
+            "${OHOS_SDK_MIRROR}/${OHOS_NATIVE_ZIP}"
+          echo "${OHOS_NATIVE_SHA256}  $RUNNER_TEMP/native-linux.zip" | sha256sum -c -
+          mkdir -p ~/ohos-native
+          unzip -q "$RUNNER_TEMP/native-linux.zip" -d ~/ohos-native
+          rm -f "$RUNNER_TEMP/native-linux.zip"
+
+      # x64 宿主上没有 aarch64 musl gcc；伪造一个同名命令给上游脚本编 libcap.a。
+      # 用 OHOS clang 而非 zig：zig cc 对 musl target 强制 emulated-TLS，libcap
+      # 的 _Thread_local 会产生 __emutls_get_address 引用，而该运行时符号在
+      # OHOS compiler-rt、Ubuntu cross libgcc、甚至 zig 自己的 libcompiler_rt.a
+      # 里都没有（三者均实测排除——aarch64-linux 是 native-TLS 目标）。OHOS
+      # clang 默认 native TLS，libcap.a 从根上不产生 emutls 引用；且 libcap
+      # 最终就是链进 OHOS libc 的，用 OHOS 编译器+sysroot 更一致。
+      # （codex 主程序的其余 C 依赖没有 TLS，继续用 zigcc 编不受影响。）
+      - name: Provide aarch64-linux-musl-gcc shim (OHOS clang)
         run: |
           set -euo pipefail
-          zig_bin="$(command -v zig)"
+          NATIVE="$HOME/ohos-native/native"
+          test -x "$NATIVE/llvm/bin/clang"
           sudo tee /usr/local/bin/aarch64-linux-musl-gcc >/dev/null <<EOF
           #!/usr/bin/env bash
-          exec "${zig_bin}" cc -target aarch64-linux-musl "\$@"
+          exec "$NATIVE/llvm/bin/clang" --target=aarch64-linux-ohos --sysroot="$NATIVE/sysroot" "\$@"
           EOF
           sudo chmod +x /usr/local/bin/aarch64-linux-musl-gcc
           aarch64-linux-musl-gcc --version | head -1
@@ -139,9 +165,9 @@ jobs:
       #   CC_aarch64_unknown_linux_musl（上游已写）+ 这里补写的
       #   CFLAGS_aarch64_unknown_linux_musl（把 aws-lc/boringssl 在 clang 下需要
       #   的 -pthread -Wno-error=frame-larger-than 只给 target）。
-      #   （注：bwrap 的 emulated-TLS 问题不在这里解决——zig 对 musl 强制 emutls，
-      #   -fno-emulated-tls 无效；改由链接器包装脚本追加 OHOS compiler-rt 提供
-      #   __emutls_get_address，见 "Set up OHOS linker" 步骤。）
+      #   （注：libcap 的 emulated-TLS 问题不在这里解决——libcap 由上游脚本的
+      #   make 构建，不读这些变量；已通过把 aarch64-linux-musl-gcc shim 换成
+      #   OHOS clang（native TLS）从源头解决，见 "Provide ... shim" 步骤。）
       #   cc-rs 变量优先级：<VAR>_<target> > TARGET_<VAR> > <VAR>，故 target
       #   编译用 zigcc + 上述 CFLAGS，host 编译用干净的 cc + 空 CFLAGS，互不干扰。
       - name: Isolate host/target C compiler env
@@ -165,24 +191,6 @@ jobs:
           echo "AWS_LC_SYS_NO_JITTER_ENTROPY=1" >> "$GITHUB_ENV"
           echo "AWS_LC_SYS_NO_JITTER_ENTROPY_aarch64_unknown_linux_musl=1" >> "$GITHUB_ENV"
 
-      - name: Restore OHOS native toolchain cache
-        id: sdk-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/ohos-native
-          key: ohos-native-linux-x64-${{ env.OHOS_SDK_RELEASE }}
-
-      - name: Download OHOS native toolchain (GitHub mirror)
-        if: steps.sdk-cache.outputs.cache-hit != 'true'
-        run: |
-          set -euxo pipefail
-          curl -fL --retry 3 -o "$RUNNER_TEMP/native-linux.zip" \
-            "${OHOS_SDK_MIRROR}/${OHOS_NATIVE_ZIP}"
-          echo "${OHOS_NATIVE_SHA256}  $RUNNER_TEMP/native-linux.zip" | sha256sum -c -
-          mkdir -p ~/ohos-native
-          unzip -q "$RUNNER_TEMP/native-linux.zip" -d ~/ohos-native
-          rm -f "$RUNNER_TEMP/native-linux.zip"
-
       # 最终链接器：OHOS clang + OHOS musl sysroot。包装脚本过滤 rustc 为 musl
       # 目标默认传入、与我们 -static-pie + OHOS libc 冲突的参数：
       #   - -static 和 -no-pie：rustc 因 crt-static 默认想产 ET_EXEC，与
@@ -203,24 +211,6 @@ jobs:
           if ! "$NATIVE/llvm/bin/ld.lld" --help | grep -- '--code-sign' >/dev/null; then
             echo "This SDK's lld lacks --code-sign; use >= 7.0-Beta1" >&2; exit 1
           fi
-          # 定位提供 __emutls_get_address 的静态库。背景:zig cc 对 musl target
-          # 强制 emulated-TLS(-fno-emulated-tls 无效),zig 编译的 libcap.a 引用
-          # __emutls_get_address;我们链接 -nodefaultlibs,须显式提供。
-          # 实测排除:OHOS SDK 的 libclang_rt.builtins.a 没编 emutls(OHOS 全
-          # native TLS);Ubuntu gcc-cross 的 libgcc.a 也没有(gcc 只给无 native
-          # TLS 的目标编 emutls,aarch64-linux 不在其列)。
-          # 唯一保证匹配的来源:zig 自己的 compiler_rt(zig 强制 emutls,必自带
-          # 运行时 emutls.zig;生成调用与提供运行时是同一工具链,ABI 必配)。
-          # 做法:独立缓存目录里让 zig 哑链接一次,从缓存挖出 libcompiler_rt.a。
-          rtcache="$RUNNER_TEMP/zig-rt-cache"
-          rm -rf "$rtcache"; mkdir -p "$rtcache"
-          echo 'int main(){return 0;}' > "$RUNNER_TEMP/d.c"
-          ZIG_GLOBAL_CACHE_DIR="$rtcache" ZIG_LOCAL_CACHE_DIR="$rtcache" \
-            zig cc -target aarch64-linux-musl "$RUNNER_TEMP/d.c" -o "$RUNNER_TEMP/d.out"
-          RTLIB="$(find "$rtcache" \( -name 'libcompiler_rt.a' -o -name 'compiler_rt.o' \) -type f 2>/dev/null | head -1)"
-          test -n "$RTLIB" && test -f "$RTLIB" \
-            || { echo "cannot extract zig compiler_rt from cache"; find "$rtcache" -name '*.a' -o -name '*.o' | head; exit 1; }
-          echo "emutls provider = $RTLIB"
           wrapper="$RUNNER_TEMP/ohos-link-clang"
           cat > "$wrapper" <<EOF
           #!/usr/bin/env bash
@@ -244,24 +234,15 @@ jobs:
             esac
             args+=("\$a")
           done
-          # libgcc.a 放最后提供 __emutls_get_address(zig 编译的 libcap 引用);
-          # 其后再补一次 -lc:emutls 需要 pthread_key_*/malloc,归档从左到右
-          # 解析,避免 libc.a 成员未被拉入的顺序问题。未引用的成员不会进产物,
-          # 纯 Rust 的 codex/host/proxy 不受影响。
-          exec "$NATIVE/llvm/bin/clang" --target=aarch64-linux-ohos --sysroot="$NATIVE/sysroot" "\${args[@]}" "$RTLIB" -lc
+          exec "$NATIVE/llvm/bin/clang" --target=aarch64-linux-ohos --sysroot="$NATIVE/sysroot" "\${args[@]}"
           EOF
           chmod +x "$wrapper"
-          # 冒烟 1：包装器能把最小 C 程序链成 static-pie + 签名（模拟 rustc 会传的
+          # 冒烟：包装器能把最小 C 程序链成 static-pie + 签名（模拟 rustc 会传的
           # 冲突参数 -static -no-pie，确认被正确过滤）。
           echo 'int main(){return 0;}' > "$RUNNER_TEMP/t.c"
           "$wrapper" "$RUNNER_TEMP/t.c" -static -no-pie -static-pie -Wl,--code-sign -o "$RUNNER_TEMP/t.out"
           "$NATIVE/llvm/bin/llvm-readelf" -h "$RUNNER_TEMP/t.out" | grep -E 'Type:.*DYN'
           "$NATIVE/llvm/bin/llvm-readelf" -S "$RUNNER_TEMP/t.out" | grep codesign
-          # 冒烟 2：确认选中的归档确实提供 __emutls_get_address（定义符号，
-          # T=text 或 W=weak），定位错就早失败，不拖到 bwrap 链接期。
-          "$NATIVE/llvm/bin/llvm-nm" "$RTLIB" 2>/dev/null | grep -qE ' [TW] __emutls_get_address' \
-            || { echo "selected archive lacks __emutls_get_address: $RTLIB"; exit 1; }
-          echo "emutls provider exports __emutls_get_address: OK"
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$wrapper" >> "$GITHUB_ENV"
           echo "OHOS_NATIVE=$NATIVE" >> "$GITHUB_ENV"
 
@@ -297,9 +278,9 @@ jobs:
           BW="target/${TARGET}/release/bwrap"
           test -f "$BW"
           # bwrap 已是链接期 strip+签名的最终字节，直接对其算摘要（不能再 strip，
-          # 否则毁签名且改变字节使摘要与打包内容不符）。__emutls_get_address 由
-          # 链接器包装脚本追加的 OHOS compiler-rt 提供（zig 对 musl 强制 emutls，
-          # -fno-emulated-tls 无效，故走 compiler-rt 方案）。
+          # 否则毁签名且改变字节使摘要与打包内容不符）。它链接的 libcap.a 由
+          # OHOS clang shim 编译（native TLS），不存在 emutls 符号问题；libcap
+          # 在 RUNNER_TEMP 下每轮重建，不受 cargo 缓存影响。
           digest="$(sha256sum "$BW" | awk '{print $1}')"
           echo "CODEX_BWRAP_SHA256=${digest}" >> "$GITHUB_ENV"
           echo "bwrap sha256 = ${digest}"
