@@ -125,7 +125,12 @@ jobs:
       # aarch64 目标编译改由 target-suffixed 变量承载：
       #   CC_aarch64_unknown_linux_musl（上游已写）+ 这里补写的
       #   CFLAGS_aarch64_unknown_linux_musl（把 aws-lc/boringssl 在 clang 下需要
-      #   的 -pthread -Wno-error=frame-larger-than 只给 target）。
+      #   的 -pthread -Wno-error=frame-larger-than 只给 target；另加
+      #   -fno-emulated-tls：bwrap 的 vendored bubblewrap C 用 thread_local，
+      #   zigcc 默认对该 target 生成 emulated-TLS 调用 __emutls_get_address，
+      #   而该符号由 compiler-rt 提供，但我们链接 -nodefaultlibs 只留 rust 的
+      #   libcompiler_builtins（不含 emutls）→ undefined symbol。改用 aarch64
+      #   native ELF TLS 从源头消除该符号引用）。
       #   cc-rs 变量优先级：<VAR>_<target> > TARGET_<VAR> > <VAR>，故 target
       #   编译用 zigcc + 上述 CFLAGS，host 编译用干净的 cc + 空 CFLAGS，互不干扰。
       - name: Isolate host/target C compiler env
@@ -138,8 +143,8 @@ jobs:
             echo "CXXFLAGS="
             echo "CMAKE_C_COMPILER=cc"
             echo "CMAKE_CXX_COMPILER=c++"
-            echo "CFLAGS_aarch64_unknown_linux_musl=-pthread -Wno-error=frame-larger-than"
-            echo "CXXFLAGS_aarch64_unknown_linux_musl=-pthread -Wno-error=frame-larger-than"
+            echo "CFLAGS_aarch64_unknown_linux_musl=-pthread -Wno-error=frame-larger-than -fno-emulated-tls"
+            echo "CXXFLAGS_aarch64_unknown_linux_musl=-pthread -Wno-error=frame-larger-than -fno-emulated-tls"
           } >> "$GITHUB_ENV"
 
       # 见上游 rust-release.yml：musl 上 aws-lc 的 jitter entropy 路径有问题，关掉。
