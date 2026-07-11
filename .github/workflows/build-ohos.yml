@@ -114,25 +114,32 @@ jobs:
           bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
 
       # 关键 host/target 隔离：上游脚本给 $GITHUB_ENV 写了全局无后缀
-      # CC/CXX/CMAKE_*（都指向 aarch64 的 zigcc）。它本为 arm64 runner 写
-      # （host==target），但在 x64 host 上，cargo 为 host 编译 build-script 里的
-      # C 代码（host 版 ring/sqlite3 的汇编）时，cc-rs 回退到全局 CC=zigcc →
-      # 用 aarch64 编译器编出 aarch64 对象，链进 x64 proc-macro 就
-      # "incompatible with elf64-x86-64"。
-      # 修法：把全局 CC/CXX/CMAKE_* 重置为 host 的 cc/c++；aarch64 目标编译由
-      # 上游已写好的 target-suffixed 变量（CC_aarch64_unknown_linux_musl 等，
-      # cc-rs 优先级高于全局）承载，不受影响。
-      # 注意：全局 CFLAGS/CXXFLAGS 保持不动——上游没有 target-suffixed 版本，
-      # target 编译（aws-lc 等）仍靠它拿到 -pthread / -Wno-error=frame-larger-than；
-      # 这些 flag 传给 host cc/gcc 也合法无害。
-      - name: Reset global C compiler to host (keep target-suffixed + CFLAGS)
+      # CC/CXX/CFLAGS/CXXFLAGS/CMAKE_*（都面向 aarch64 zigcc）。它本为 arm64
+      # runner 写（host==target），在 x64 host 上有两处污染 host 编译：
+      #   1. 全局 CC=zigcc → cargo 为 host 编 build-script 的 C 代码（host 版
+      #      ring/sqlite3 汇编）时 cc-rs 回退到它，用 aarch64 编译器产出 aarch64
+      #      对象 → 链进 x64 proc-macro "incompatible with elf64-x86-64"。
+      #   2. 全局 CFLAGS 含 clang 专用 -Wno-error=frame-larger-than → host gcc
+      #      不认（gcc 要带等号）→ host ring 每个 .c 编译失败。
+      # 修法：全局 CC/CXX/CFLAGS/CXXFLAGS/CMAKE_* 全部重置为 host 干净值；
+      # aarch64 目标编译改由 target-suffixed 变量承载：
+      #   CC_aarch64_unknown_linux_musl（上游已写）+ 这里补写的
+      #   CFLAGS_aarch64_unknown_linux_musl（把 aws-lc/boringssl 在 clang 下需要
+      #   的 -pthread -Wno-error=frame-larger-than 只给 target）。
+      #   cc-rs 变量优先级：<VAR>_<target> > TARGET_<VAR> > <VAR>，故 target
+      #   编译用 zigcc + 上述 CFLAGS，host 编译用干净的 cc + 空 CFLAGS，互不干扰。
+      - name: Isolate host/target C compiler env
         run: |
           set -euo pipefail
           {
             echo "CC=cc"
             echo "CXX=c++"
+            echo "CFLAGS="
+            echo "CXXFLAGS="
             echo "CMAKE_C_COMPILER=cc"
             echo "CMAKE_CXX_COMPILER=c++"
+            echo "CFLAGS_aarch64_unknown_linux_musl=-pthread -Wno-error=frame-larger-than"
+            echo "CXXFLAGS_aarch64_unknown_linux_musl=-pthread -Wno-error=frame-larger-than"
           } >> "$GITHUB_ENV"
 
       # 见上游 rust-release.yml：musl 上 aws-lc 的 jitter entropy 路径有问题，关掉。
