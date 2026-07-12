@@ -114,12 +114,13 @@ jobs:
           rm -f "$RUNNER_TEMP/native-linux.zip"
 
       # x64 宿主上没有 aarch64 musl gcc；伪造一个同名命令给上游脚本编 libcap.a。
-      # 用 OHOS clang 而非 zig：zig cc 对 musl target 强制 emulated-TLS，libcap
-      # 的 _Thread_local 会产生 __emutls_get_address 引用，而该运行时符号在
-      # OHOS compiler-rt、Ubuntu cross libgcc、甚至 zig 自己的 libcompiler_rt.a
-      # 里都没有（三者均实测排除——aarch64-linux 是 native-TLS 目标）。OHOS
-      # clang 默认 native TLS，libcap.a 从根上不产生 emutls 引用；且 libcap
-      # 最终就是链进 OHOS libc 的，用 OHOS 编译器+sysroot 更一致。
+      # 用 OHOS clang 而非 zig：libcap 最终链进 OHOS libc，用 OHOS 编译器
+      # +sysroot 最一致。emutls 更正：此前判定"OHOS compiler-rt 没有
+      # __emutls_get_address"是 grep ' T ' 的假阴性——它在 SDK 的
+      # libclang_rt.builtins.a 里是弱符号 'W'（已在真机 SDK 复核，且
+      # OHOS libc.a 自己的 cxa_thread_atexit_impl.o 就带 emutls 引用，谁都
+      # 绕不开）。现在由链接器包装脚本统一附加 SDK builtins.a 兜底解析一切
+      # emulated-TLS 引用，见 "Set up OHOS linker" 步骤。
       # （codex 主程序的其余 C 依赖没有 TLS，继续用 zigcc 编不受影响。）
       - name: Provide aarch64-linux-musl-gcc shim (OHOS clang)
         run: |
@@ -201,6 +202,14 @@ jobs:
       #   - */self-contained/*.o：rust 自带 vanilla musl 的 crt1/crti/crtbegin/
       #     crtend/crtn 等对象，全部丢弃（含 crtbegin/crtend，不只 crt1/crti）。
       #   - -L */self-contained*：防止 -lc/-lunwind 解析到 rust 的 vanilla musl。
+      # 并在链接末尾无条件附加 SDK 的 libclang_rt.builtins.a：OHOS 静态 libc.a
+      # 的 cxa_thread_atexit_impl.o（华为线程 dtor 改造）以 emulated-TLS 编译，
+      # 引用 __emutls_get_address；纯 Rust 的 codex 不受影响（Rust std 对
+      # __cxa_thread_atexit_impl 是弱引用，不触发该归档成员抽取），但 bwrap
+      # 链接 libcap/standalone_bwrap 等 C 归档时会拉进来。该符号在 builtins.a
+      # 里是弱符号 'W'（真机 SDK 实测；上轮 grep ' T ' 是假阴性）。lld 对归档
+      # 全局惰性解析：只有未决引用才抽取成员，且与 rust 自带 compiler_builtins
+      # 不冲突（已定义符号不再抽取），纯 Rust 链接零开销。
       # 探测 lld 支持 --code-sign 再放行。
       - name: Set up OHOS linker (overrides musl gcc)
         run: |
@@ -210,6 +219,13 @@ jobs:
           test -d "$NATIVE/sysroot"
           if ! "$NATIVE/llvm/bin/ld.lld" --help | grep -- '--code-sign' >/dev/null; then
             echo "This SDK's lld lacks --code-sign; use >= 7.0-Beta1" >&2; exit 1
+          fi
+          RTLIB="$(find "$NATIVE/llvm/lib/clang" -path '*aarch64-linux-ohos*' -name 'libclang_rt.builtins.a' | head -1)"
+          test -f "$RTLIB"
+          # 弱符号是 'W' 不是 'T'；用 if ! ... >/dev/null 而非 grep -q，避免
+          # pipefail 下 grep -q 提前退出触发上游 SIGPIPE 的假失败。
+          if ! "$NATIVE/llvm/bin/llvm-nm" "$RTLIB" | grep -E '[TW] __emutls_get_address' >/dev/null; then
+            echo "builtins archive lacks __emutls_get_address: $RTLIB" >&2; exit 1
           fi
           wrapper="$RUNNER_TEMP/ohos-link-clang"
           cat > "$wrapper" <<EOF
@@ -234,15 +250,26 @@ jobs:
             esac
             args+=("\$a")
           done
-          exec "$NATIVE/llvm/bin/clang" --target=aarch64-linux-ohos --sysroot="$NATIVE/sysroot" "\${args[@]}"
+          exec "$NATIVE/llvm/bin/clang" --target=aarch64-linux-ohos --sysroot="$NATIVE/sysroot" "\${args[@]}" "$RTLIB"
           EOF
           chmod +x "$wrapper"
-          # 冒烟：包装器能把最小 C 程序链成 static-pie + 签名（模拟 rustc 会传的
+          # 冒烟 1：包装器能把最小 C 程序链成 static-pie + 签名（模拟 rustc 会传的
           # 冲突参数 -static -no-pie，确认被正确过滤）。
           echo 'int main(){return 0;}' > "$RUNNER_TEMP/t.c"
           "$wrapper" "$RUNNER_TEMP/t.c" -static -no-pie -static-pie -Wl,--code-sign -o "$RUNNER_TEMP/t.out"
           "$NATIVE/llvm/bin/llvm-readelf" -h "$RUNNER_TEMP/t.out" | grep -E 'Type:.*DYN'
           "$NATIVE/llvm/bin/llvm-readelf" -S "$RUNNER_TEMP/t.out" | grep codesign
+          # 冒烟 2：emulated-TLS 引用（等价于 OHOS libc.a cxa_thread_atexit_impl.o
+          # 的场景）能被附加的 builtins.a 解析。真机同构验证已通过：该产物在
+          # 鸿蒙内核上实际运行返回 0。
+          printf '_Thread_local int x = 42;\nint main(void){return x-42;}\n' > "$RUNNER_TEMP/ttls.c"
+          "$NATIVE/llvm/bin/clang" --target=aarch64-linux-ohos --sysroot="$NATIVE/sysroot" \
+            -femulated-tls -c "$RUNNER_TEMP/ttls.c" -o "$RUNNER_TEMP/ttls.o"
+          if ! "$NATIVE/llvm/bin/llvm-nm" "$RUNNER_TEMP/ttls.o" | grep 'U __emutls_get_address' >/dev/null; then
+            echo "smoke object lacks expected emutls reference" >&2; exit 1
+          fi
+          "$wrapper" "$RUNNER_TEMP/ttls.o" -static -no-pie -static-pie -Wl,--code-sign -o "$RUNNER_TEMP/ttls.out"
+          "$NATIVE/llvm/bin/llvm-readelf" -h "$RUNNER_TEMP/ttls.out" | grep -E 'Type:.*DYN'
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$wrapper" >> "$GITHUB_ENV"
           echo "OHOS_NATIVE=$NATIVE" >> "$GITHUB_ENV"
 
@@ -316,8 +343,12 @@ jobs:
             fi
             "$READELF" -S "$BIN" | grep -q codesign \
               || { echo "$b has no .codesign section"; exit 1; }
-            python3 /tmp/verify-codesign.py "$BIN" | tee /dev/stderr | grep -q "MATCH: True" \
-              || { echo "$b code signature root hash is INVALID"; exit 1; }
+            vout="$(python3 /tmp/verify-codesign.py "$BIN")"
+            echo "$vout"
+            case "$vout" in
+              *"MATCH: True"*) : ;;
+              *) echo "$b code signature root hash is INVALID"; exit 1 ;;
+            esac
             echo "OK: $b aarch64 static-PIE, no INTERP, .codesign MATCH"
           done
 
