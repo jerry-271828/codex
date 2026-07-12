@@ -51,6 +51,7 @@ use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
+use codex_utils_output_truncation::approx_token_count;
 use core_test_support::PathBufExt;
 use core_test_support::TestCodexResponsesRequestKind;
 use core_test_support::apps_test_server::AppsTestServer;
@@ -2093,6 +2094,118 @@ async fn skills_append_to_developer_message() {
     assert!(
         developer_text.contains(&expected_path_str),
         "expected path {expected_path_str} in developer message: {developer_messages:?}"
+    );
+    let _codex_home_guard = codex_home;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_skills_context_budget_reaches_developer_message() {
+    skip_if_no_network!();
+    let server = MockServer::start().await;
+
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"developer_instructions = "BEFORE_SKILLS"
+model_context_window = 128000
+
+[features]
+token_budget = true
+
+[skills]
+context_budget_tokens = 100000
+
+[skills.bundled]
+enabled = false
+"#,
+    )
+    .expect("write config");
+    for index in 0..120 {
+        let name = format!("budget-skill-{index:03}");
+        let skill_dir = codex_home.path().join("skills").join(&name);
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: configurable-budget-test-{}\n---\n\n# body\n",
+                "x".repeat(990)
+            ),
+        )
+        .expect("write skill");
+    }
+
+    let codex_home_path = codex_home.path().to_path_buf();
+    let mut builder = test_codex()
+        .with_home(codex_home.clone())
+        .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .with_config(move |config| {
+            config.cwd = codex_home_path.abs();
+        });
+    let codex = builder
+        .build(&server)
+        .await
+        .expect("create new conversation")
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request = resp_mock.single_request();
+    let developer_messages = request.message_input_texts("developer");
+    let before_index = developer_messages
+        .iter()
+        .position(|text| text.contains("BEFORE_SKILLS"))
+        .expect("pre-skills developer instructions should be present");
+    let skill_indexes = developer_messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, text)| text.contains("<skills_instructions>").then_some(index))
+        .collect::<Vec<_>>();
+    let context_window_index = developer_messages
+        .iter()
+        .position(|text| text.contains("<context_window>"))
+        .expect("post-skills token budget context should be present");
+    assert!(
+        skill_indexes.len() > 1,
+        "expected configured budget to produce multiple skills messages: {developer_messages:?}"
+    );
+    assert!(
+        before_index < skill_indexes[0]
+            && skill_indexes
+                .last()
+                .is_some_and(|index| *index < context_window_index),
+        "expected developer instructions, skills chunks, then context window: {developer_messages:?}"
+    );
+    assert!(
+        skill_indexes
+            .iter()
+            .all(|index| { approx_token_count(developer_messages[*index]) <= 9_000 }),
+        "expected every skills message to stay within 9,000 approximate tokens"
+    );
+    let developer_text = developer_messages.join("\n\n");
+    assert!(
+        developer_text.contains("budget-skill-000: configurable-budget-test-")
+            && developer_text.contains("budget-skill-119: configurable-budget-test-"),
+        "expected configured budget to retain the full skills catalog"
     );
     let _codex_home_guard = codex_home;
 }

@@ -4,8 +4,14 @@ use codex_core_skills::SKILLS_HOW_TO_USE_WITH_ALIASES;
 use codex_core_skills::render_available_skills_body;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
+use codex_utils_output_truncation::approx_bytes_for_tokens;
+use codex_utils_output_truncation::approx_token_count;
 
 use super::ContextualUserFragment;
+
+const MAX_SKILLS_CONTEXT_FRAGMENT_TOKENS: usize = 9_000;
+const SKILLS_CONTEXT_MARKER_BYTES: usize =
+    SKILLS_INSTRUCTIONS_OPEN_TAG.len() + SKILLS_INSTRUCTIONS_CLOSE_TAG.len();
 
 /// Model-context fragment describing the skills available to Codex.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +48,57 @@ impl AvailableSkillsInstructions {
             skill_lines,
         }
     }
+
+    pub(crate) fn render_chunks(&self) -> Vec<String> {
+        let body = self.body();
+        let render_chunk = |body: &str| {
+            format!("{SKILLS_INSTRUCTIONS_OPEN_TAG}{body}{SKILLS_INSTRUCTIONS_CLOSE_TAG}")
+        };
+        if approx_token_count(&render_chunk(&body)) <= MAX_SKILLS_CONTEXT_FRAGMENT_TOKENS {
+            return vec![render_chunk(&body)];
+        }
+
+        let mut chunks = Vec::new();
+        let mut current = String::new();
+        for line in body.split_inclusive('\n') {
+            let mut candidate = current.clone();
+            candidate.push_str(line);
+            if !current.is_empty()
+                && approx_token_count(&render_chunk(&candidate))
+                    > MAX_SKILLS_CONTEXT_FRAGMENT_TOKENS
+            {
+                chunks.push(render_chunk(&current));
+                current.clear();
+            }
+            let mut remaining = line;
+            while approx_token_count(&render_chunk(remaining)) > MAX_SKILLS_CONTEXT_FRAGMENT_TOKENS
+            {
+                let max_body_bytes = approx_bytes_for_tokens(MAX_SKILLS_CONTEXT_FRAGMENT_TOKENS)
+                    .saturating_sub(SKILLS_CONTEXT_MARKER_BYTES);
+                let split_at = remaining
+                    .char_indices()
+                    .take_while(|(index, character)| {
+                        index.saturating_add(character.len_utf8()) <= max_body_bytes
+                    })
+                    .map(|(index, character)| index + character.len_utf8())
+                    .last()
+                    .unwrap_or(remaining.len());
+                let (prefix, suffix) = remaining.split_at(split_at);
+                chunks.push(render_chunk(prefix));
+                remaining = suffix;
+            }
+            current.push_str(remaining);
+        }
+        if !current.is_empty() {
+            chunks.push(render_chunk(&current));
+        }
+        chunks
+    }
 }
+
+#[cfg(test)]
+#[path = "available_skills_instructions_tests.rs"]
+mod tests;
 
 impl ContextualUserFragment for AvailableSkillsInstructions {
     fn role(&self) -> &'static str {

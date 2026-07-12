@@ -327,6 +327,7 @@ fn parses_bundled_skills_config() {
         r#"
 [skills]
 include_instructions = false
+context_budget_tokens = 16000
 
 [skills.bundled]
 enabled = false
@@ -339,6 +340,7 @@ enabled = false
         Some(SkillsConfig {
             bundled: Some(BundledSkillsConfig { enabled: false }),
             include_instructions: Some(false),
+            context_budget_tokens: NonZeroUsize::new(16_000),
             config: Vec::new(),
         })
     );
@@ -10096,6 +10098,7 @@ include_environment_context = false
 
 [skills]
 include_instructions = false
+context_budget_tokens = 32000
 "#,
     )?;
 
@@ -10109,6 +10112,10 @@ include_instructions = false
     assert!(!config.include_apps_instructions);
     assert!(!config.include_collaboration_mode_instructions);
     assert!(!config.include_skill_instructions);
+    assert_eq!(
+        config.skill_context_budget_tokens,
+        NonZeroUsize::new(32_000)
+    );
     assert!(!config.include_environment_context);
     Ok(())
 }

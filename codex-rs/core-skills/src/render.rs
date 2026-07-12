@@ -22,7 +22,6 @@ const TRUNCATED_SKILL_DESCRIPTION_SUFFIX: &str = "...";
 const SKILL_DESCRIPTION_TRUNCATION_WARNING_THRESHOLD_CHARS: usize = 100;
 const APPROX_BYTES_PER_TOKEN: usize = 4;
 pub const SKILL_DESCRIPTION_TRUNCATED_WARNING: &str = "Skill descriptions were shortened to fit the skills context budget. Codex can still see every skill, but some descriptions are shorter. Disable unused skills or plugins to leave more room for the rest.";
-pub const SKILL_DESCRIPTION_TRUNCATED_WARNING_WITH_PERCENT: &str = "Skill descriptions were shortened to fit the 2% skills context budget. Codex can still see every skill, but some descriptions are shorter. Disable unused skills or plugins to leave more room for the rest.";
 pub const SKILL_DESCRIPTIONS_REMOVED_WARNING_PREFIX: &str =
     "Exceeded skills context budget. All skill descriptions were removed and";
 pub const SKILLS_INTRO_WITH_ABSOLUTE_PATHS: &str = "A skill is a set of instructions provided through a `SKILL.md` source. Below is the list of skills that can be used. Each entry includes a name, description, and source locator. `file` locators are on the host filesystem, `environment resource` locators are owned by an execution environment, `orchestrator resource` locators are opaque non-filesystem resources, and `custom resource` locators use their provider's access mechanism.";
@@ -218,21 +217,12 @@ fn build_available_skills_from_lines(
         };
         Some(format!(
             "{} {} additional {} {} not included in the model-visible skills list.",
-            budget_warning_prefix(budget, SKILL_DESCRIPTIONS_REMOVED_WARNING_PREFIX),
-            report.omitted_count,
-            skill_word,
-            verb
+            SKILL_DESCRIPTIONS_REMOVED_WARNING_PREFIX, report.omitted_count, skill_word, verb
         ))
     } else if report.average_truncated_description_chars()
         > SKILL_DESCRIPTION_TRUNCATION_WARNING_THRESHOLD_CHARS
     {
-        Some(
-            match budget {
-                SkillMetadataBudget::Tokens(_) => SKILL_DESCRIPTION_TRUNCATED_WARNING_WITH_PERCENT,
-                SkillMetadataBudget::Characters(_) => SKILL_DESCRIPTION_TRUNCATED_WARNING,
-            }
-            .to_string(),
-        )
+        Some(SKILL_DESCRIPTION_TRUNCATED_WARNING.to_string())
     } else {
         None
     };
@@ -268,17 +258,6 @@ fn record_available_skills_side_effects(
             truncated_skill_descriptions = available.report.truncated_description_count,
             "truncated skill metadata to fit skills context budget"
         );
-    }
-}
-
-fn budget_warning_prefix(budget: SkillMetadataBudget, prefix: &str) -> String {
-    match budget {
-        SkillMetadataBudget::Tokens(_) => prefix.replacen(
-            "Exceeded skills context budget.",
-            "Exceeded skills context budget of 2%.",
-            1,
-        ),
-        SkillMetadataBudget::Characters(_) => prefix.to_string(),
     }
 }
 
@@ -1142,7 +1121,7 @@ mod tests {
     }
 
     #[test]
-    fn budgeted_rendering_token_budget_truncation_warning_mentions_two_percent() {
+    fn budgeted_rendering_token_budget_uses_generic_truncation_warning() {
         let long_description = "a".repeat(1000);
         let long_skill =
             make_skill_with_description("long-skill", SkillScope::Repo, &long_description);
@@ -1155,7 +1134,7 @@ mod tests {
 
         assert_eq!(
             rendered.warning_message,
-            Some(SKILL_DESCRIPTION_TRUNCATED_WARNING_WITH_PERCENT.to_string())
+            Some(SKILL_DESCRIPTION_TRUNCATED_WARNING.to_string())
         );
     }
 

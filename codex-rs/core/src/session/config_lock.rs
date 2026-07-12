@@ -188,10 +188,9 @@ fn save_config_resolved_fields(
     agents.job_max_runtime_seconds = config.agent_job_max_runtime_seconds;
     agents.interrupt_message = Some(config.agent_interrupt_message_enabled);
 
-    lock_config
-        .skills
-        .get_or_insert_with(Default::default)
-        .include_instructions = Some(config.include_skill_instructions);
+    let skills = lock_config.skills.get_or_insert_with(Default::default);
+    skills.include_instructions = Some(config.include_skill_instructions);
+    skills.context_budget_tokens = config.skill_context_budget_tokens;
     lock_config
         .orchestrator
         .get_or_insert_with(OrchestratorToml::default)
@@ -239,12 +238,14 @@ where
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
 
     #[tokio::test]
     async fn lock_contains_prompts_and_materializes_features() {
         let mut sc = crate::session::tests::make_session_configuration_for_tests().await;
         let mut config = (*sc.original_config_do_not_use).clone();
+        config.skill_context_budget_tokens = NonZeroUsize::new(32_000);
         config.token_budget = Some(crate::config::TokenBudgetConfig {
             reminder_threshold_tokens: Some(16_000),
             reminder_message_template: "Locked reminder: {n_remaining} tokens.".to_string(),
@@ -293,6 +294,12 @@ mod tests {
                 .is_none_or(|debug| debug.config_lockfile.is_none())
         );
         assert!(lock.memories.is_some());
+        assert_eq!(
+            lock.skills
+                .as_ref()
+                .and_then(|skills| skills.context_budget_tokens),
+            NonZeroUsize::new(32_000)
+        );
 
         let features = lock
             .features

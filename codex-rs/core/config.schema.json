@@ -2888,6 +2888,13 @@
           },
           "type": "array"
         },
+        "context_budget_tokens": {
+          "description": "Fixed aggregate token budget for model-visible host skill metadata.",
+          "format": "uint",
+          "maximum": 100000.0,
+          "minimum": 1.0,
+          "type": "integer"
+        },
         "include_instructions": {
           "description": "Whether turns receive the automatic skills instructions block.",
           "type": "boolean"

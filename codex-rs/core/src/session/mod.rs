@@ -43,6 +43,7 @@ use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::skills::SkillRenderSideEffects;
+use crate::skills::render::SkillMetadataBudget;
 use crate::skills_load_input_from_config;
 use crate::turn_metadata::TurnMetadataState;
 use crate::turn_timing::now_unix_timestamp_ms;
@@ -3192,6 +3193,7 @@ impl Session {
     ) -> Vec<ResponseItem> {
         let mut developer_sections = Vec::<String>::with_capacity(8);
         let mut contextual_user_sections = Vec::<String>::with_capacity(2);
+        let mut leading_developer_messages = Vec::<Vec<String>>::new();
         let mut separate_developer_sections = Vec::<String>::new();
         let (
             reference_context_item,
@@ -3291,7 +3293,10 @@ impl Session {
         if turn_context.config.include_skill_instructions {
             let available_skills = build_available_skills(
                 turn_context.turn_skills.snapshot.outcome(),
-                default_skill_metadata_budget(turn_context.model_info.context_window),
+                turn_context.config.skill_context_budget_tokens.map_or_else(
+                    || default_skill_metadata_budget(turn_context.model_info.context_window),
+                    |budget| SkillMetadataBudget::Tokens(budget.get()),
+                ),
                 SkillRenderSideEffects::ThreadStart {
                     session_telemetry: &self.services.session_telemetry,
                 },
@@ -3311,7 +3316,16 @@ impl Session {
                     })
                     .await;
                 }
-                developer_sections.push(skills_instructions.render());
+                let skills_chunks = skills_instructions.render_chunks();
+                if skills_chunks.len() <= 1 {
+                    developer_sections.extend(skills_chunks);
+                } else {
+                    if !developer_sections.is_empty() {
+                        leading_developer_messages.push(std::mem::take(&mut developer_sections));
+                    }
+                    leading_developer_messages
+                        .extend(skills_chunks.into_iter().map(|chunk| vec![chunk]));
+                }
             }
         }
         let loaded_plugins = self
@@ -3439,7 +3453,14 @@ impl Session {
         let multi_agent_v2_usage_hint_text =
             multi_agents::usage_hint_text(turn_context, &session_source);
 
-        let mut items = Vec::with_capacity(4);
+        let mut items = Vec::with_capacity(4 + leading_developer_messages.len());
+        for sections in leading_developer_messages {
+            if let Some(developer_message) =
+                crate::context_manager::updates::build_developer_update_item(sections)
+            {
+                items.push(developer_message);
+            }
+        }
         if let Some(developer_message) =
             crate::context_manager::updates::build_developer_update_item(developer_sections)
         {

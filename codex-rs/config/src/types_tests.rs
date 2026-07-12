@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use super::*;
 use pretty_assertions::assert_eq;
 
@@ -40,6 +42,34 @@ fn deserialize_skill_config_with_path_selector() {
             enabled: false,
         }
     );
+}
+
+#[test]
+fn deserialize_skills_context_budget_tokens() {
+    let config: SkillsConfig = toml::from_str("context_budget_tokens = 16000")
+        .expect("valid skills context budget should deserialize");
+
+    assert_eq!(config.context_budget_tokens, NonZeroUsize::new(16_000));
+}
+
+#[test]
+fn reject_skills_context_budget_above_maximum() {
+    let error = toml::from_str::<SkillsConfig>("context_budget_tokens = 100001")
+        .expect_err("oversized skills context budget should be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("skills.context_budget_tokens must not exceed 100000")
+    );
+}
+
+#[test]
+fn reject_non_positive_skills_context_budget() {
+    for value in ["0", "-1"] {
+        toml::from_str::<SkillsConfig>(&format!("context_budget_tokens = {value}"))
+            .expect_err("non-positive skills context budget should be rejected");
+    }
 }
 
 #[test]
