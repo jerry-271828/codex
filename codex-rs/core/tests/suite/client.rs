@@ -2198,7 +2198,7 @@ enabled = false
     assert!(
         skill_indexes
             .iter()
-            .all(|index| { approx_token_count(developer_messages[*index]) <= 9_000 }),
+            .all(|index| approx_token_count(&developer_messages[*index]) <= 9_000),
         "expected every skills message to stay within 9,000 approximate tokens"
     );
     let developer_text = developer_messages.join("\n\n");
