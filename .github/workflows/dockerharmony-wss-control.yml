@@ -1,6 +1,10 @@
 name: DockerHarmony long-lived WSS control
 
 on:
+  push:
+    branches: [ohos-build]
+    paths:
+      - .github/workflows/dockerharmony-wss-control.yml
   workflow_dispatch:
     inputs:
       duration_minutes:
@@ -84,7 +88,7 @@ jobs:
         shell: sh
         working-directory: codex-rs
         env:
-          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+          DURATION_MINUTES: ${{ inputs.duration_minutes || '30' }}
           CODEX_WS_TRANSPORT_DIAGNOSTICS: "1"
           RUST_BACKTRACE: "1"
         run: |
