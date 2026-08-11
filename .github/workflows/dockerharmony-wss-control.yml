@@ -1,0 +1,166 @@
+name: DockerHarmony long-lived WSS control
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: Runtime for each WebSocket connection (20-45 minutes)
+        required: true
+        default: "30"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  wss-control:
+    name: OpenHarmony 6.1 userspace / native arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    container:
+      image: ghcr.io/hqzing/dockerharmony:6.1
+      volumes:
+        - /opt/action-node20:/__e/node20:rw,rshared
+        - /opt/action-node24:/__e/node24:rw,rshared
+
+    steps:
+      # DockerHarmony is a minimal OpenHarmony rootfs. Actions implemented in
+      # JavaScript need an OpenHarmony Node binary inside the container.
+      - name: Set up OpenHarmony Node for Actions
+        shell: sh
+        run: |
+          set -eu
+          curl -fL --retry 3 -o /tmp/ohos-node.tar.gz \
+            https://github.com/hqzing/ohos-node/releases/download/v24.2.0/node-v24.2.0-openharmony-arm64.tar.gz
+          tar -zxf /tmp/ohos-node.tar.gz -C /opt
+          mkdir -p /__e/node20/bin /__e/node24/bin
+          ln -sf /opt/node-v24.2.0-openharmony-arm64/bin/node /__e/node20/bin/node
+          ln -sf /opt/node-v24.2.0-openharmony-arm64/bin/node /__e/node24/bin/node
+          /__e/node24/bin/node --version
+
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install Harmonybrew native OHOS build tools
+        shell: sh
+        run: |
+          set -eu
+          curl -fL --retry 3 -o /tmp/zsh-ohos.tar.gz \
+            https://github.com/Harmonybrew/ohos-zsh/releases/download/5.9/zsh-5.9-ohos-arm64.tar.gz
+          tar -zxf /tmp/zsh-ohos.tar.gz -C /opt
+          mkdir -p /usr/bin
+          ln -sf /opt/zsh-5.9-ohos-arm64/bin/zsh /usr/bin/zsh
+          CI=1 NONINTERACTIVE=1 zsh -c "$(curl -fsSL https://harmonybrew.atomgit.com/install.sh)"
+          echo /storage/Users/currentUser/.harmonybrew/bin >> "$GITHUB_PATH"
+
+      - name: Install Rust and native dependencies
+        shell: sh
+        run: |
+          set -eu
+          export PATH=/storage/Users/currentUser/.harmonybrew/bin:$PATH
+          brew install devel-base rust cmake pkgconf perl
+          rustc -Vv
+          cargo -V
+          test "$(rustc -vV | sed -n 's/^host: //p')" = aarch64-unknown-linux-ohos
+
+      - name: Build the repository WSS probe natively for OHOS
+        shell: sh
+        working-directory: codex-rs
+        env:
+          AWS_LC_SYS_NO_JITTER_ENTROPY: "1"
+        run: |
+          set -eu
+          export PATH=/storage/Users/currentUser/.harmonybrew/bin:$PATH
+          cargo build --locked --release \
+            -p codex-websocket-client --example hmos_wss_probe
+          probe=target/release/examples/hmos_wss_probe
+          test -x "$probe"
+          llvm-readelf -h "$probe" | grep 'Machine:.*AArch64'
+          rustc -vV
+
+      - name: Run staggered long-lived WebSockets
+        id: run-probes
+        shell: sh
+        working-directory: codex-rs
+        env:
+          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+          CODEX_WS_TRANSPORT_DIAGNOSTICS: "1"
+          RUST_BACKTRACE: "1"
+        run: |
+          set -eu
+          case "$DURATION_MINUTES" in
+            ''|*[!0-9]*) echo "duration_minutes must be an integer" >&2; exit 2 ;;
+          esac
+          if [ "$DURATION_MINUTES" -lt 20 ] || [ "$DURATION_MINUTES" -gt 45 ]; then
+            echo "duration_minutes must be between 20 and 45" >&2
+            exit 2
+          fi
+
+          duration_seconds=$((DURATION_MINUTES * 60))
+          probe=target/release/examples/hmos_wss_probe
+          mkdir -p dockerharmony-control-logs
+          unset ALL_PROXY all_proxy HTTPS_PROXY https_proxy HTTP_PROXY http_proxy NO_PROXY no_proxy
+
+          "$probe" --id dockerharmony-postman --path-label dockerharmony_direct \
+            wss://ws.postman-echo.com/raw "$duration_seconds" 30 \
+            > dockerharmony-control-logs/postman.log 2>&1 &
+          postman_pid=$!
+
+          # Deliberately give the second connection a different age.
+          sleep 17
+          "$probe" --id dockerharmony-echo --path-label dockerharmony_direct \
+            wss://echo.websocket.org "$duration_seconds" 30 \
+            > dockerharmony-control-logs/echo-websocket-org.log 2>&1 &
+          echo_pid=$!
+
+          set +e
+          wait "$postman_pid"
+          postman_status=$?
+          wait "$echo_pid"
+          echo_status=$?
+          set -e
+
+          {
+            echo "postman=$postman_status"
+            echo "echo_websocket_org=$echo_status"
+          } | tee dockerharmony-control-logs/exit-status.txt
+
+      - name: Write control summary
+        if: always()
+        shell: sh
+        working-directory: codex-rs
+        run: |
+          {
+            echo '## DockerHarmony WSS control'
+            echo
+            echo 'OpenHarmony 6.1 userspace in Docker on a native arm64 Linux runner.'
+            echo 'The two endpoints start 17 seconds apart and send Ping every 30 seconds.'
+            echo
+            echo '```text'
+            if [ -f dockerharmony-control-logs/exit-status.txt ]; then
+              cat dockerharmony-control-logs/exit-status.txt
+            fi
+            grep -hE 'event=(probe_started|websocket_connected|websocket_error|websocket_stream_ended|duration_reached)' \
+              dockerharmony-control-logs/*.log 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload probe logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dockerharmony-wss-control-${{ github.run_attempt }}
+          path: codex-rs/dockerharmony-control-logs/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail if either probe ended early
+        if: always()
+        shell: sh
+        working-directory: codex-rs
+        run: |
+          test -f dockerharmony-control-logs/exit-status.txt
+          if grep -Ev '^[a-z_]+=0$' dockerharmony-control-logs/exit-status.txt | grep .; then
+            exit 1
+          fi

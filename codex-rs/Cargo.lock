@@ -4483,12 +4483,15 @@ dependencies = [
  "codex-http-client",
  "codex-utils-rustls-provider",
  "futures",
+ "libc",
  "pretty_assertions",
  "rcgen",
  "rustls",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
  "url",
 ]
 

@@ -74,10 +74,14 @@ async fn direct_route_connects_secure_websocket() {
         WebSocketConfig::default(),
         tls_config,
         OutboundProxyRoute::Direct,
+        /*diagnostics*/ None,
     )
     .await
     .expect("direct websocket handshake should succeed");
-    drop(WebSocketConnection { inner });
+    drop(WebSocketConnection {
+        inner,
+        diagnostics: None,
+    });
 
     target_task.await.expect("target task should finish");
 }
@@ -233,10 +237,14 @@ async fn assert_proxy_tunnels_secure_websocket(proxy_tls: bool) {
         OutboundProxyRoute::Proxy {
             url: format!("{proxy_scheme}://localhost:{}", proxy_addr.port()),
         },
+        /*diagnostics*/ None,
     )
     .await
     .expect("proxied websocket handshake should succeed");
-    drop(WebSocketConnection { inner });
+    drop(WebSocketConnection {
+        inner,
+        diagnostics: None,
+    });
 
     target_task.await.expect("target task should finish");
     proxy_task.await.expect("proxy task should finish");

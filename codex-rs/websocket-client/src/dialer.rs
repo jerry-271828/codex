@@ -28,6 +28,8 @@ use tokio_tungstenite::tungstenite::proxy::ProxyConfig;
 
 use crate::AsyncIo;
 use crate::ConnectionInner;
+use crate::diagnostics::DiagnosticTcpStream;
+use crate::diagnostics::TransportDiagnostics;
 
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 
@@ -36,9 +38,10 @@ pub(crate) async fn connect(
     config: WebSocketConfig,
     tls_config: Arc<ClientConfig>,
     proxy_route: OutboundProxyRoute,
+    diagnostics: Option<Arc<TransportDiagnostics>>,
 ) -> Result<(ConnectionInner, Response), WebSocketError> {
     let stream: Box<dyn AsyncIo> = match proxy_route {
-        OutboundProxyRoute::TransportDefault => {
+        OutboundProxyRoute::TransportDefault if diagnostics.is_none() => {
             // The workspace enables tokio-tungstenite's `proxy` feature, so its default dialer
             // resolves HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, and NO_PROXY before opening the socket.
             let (stream, response) = connect_async_tls_with_config(
@@ -50,22 +53,43 @@ pub(crate) async fn connect(
             .await?;
             return Ok((ConnectionInner::TransportDefault(stream), response));
         }
+        OutboundProxyRoute::TransportDefault => {
+            let host = websocket_host(&request)?;
+            let port = websocket_port(&request)?;
+            if let Some(proxy) = ProxyConfig::from_env(request.uri())? {
+                let stream = connect_tcp(proxy.authority(), diagnostics.as_deref())
+                    .await
+                    .map_err(WebSocketError::Io)?;
+                connect_via_proxy(
+                    instrument_tcp(stream, diagnostics.as_ref()),
+                    &proxy,
+                    host,
+                    port,
+                )
+                .await?
+            } else {
+                let stream = connect_tcp(host_port(host, port), diagnostics.as_deref())
+                    .await
+                    .map_err(WebSocketError::Io)?;
+                instrument_tcp(stream, diagnostics.as_ref())
+            }
+        }
         OutboundProxyRoute::Direct => {
             let host = websocket_host(&request)?;
             let port = websocket_port(&request)?;
-            Box::new(
-                connect_tcp(host_port(host, port))
-                    .await
-                    .map_err(WebSocketError::Io)?,
-            )
+            let stream = connect_tcp(host_port(host, port), diagnostics.as_deref())
+                .await
+                .map_err(WebSocketError::Io)?;
+            instrument_tcp(stream, diagnostics.as_ref())
         }
         OutboundProxyRoute::Proxy { url } => {
             let proxy = ProxyEndpoint::parse(&url)?;
             let host = websocket_host(&request)?;
             let port = websocket_port(&request)?;
-            let stream = connect_tcp(proxy.config.authority())
+            let stream = connect_tcp(proxy.config.authority(), diagnostics.as_deref())
                 .await
                 .map_err(WebSocketError::Io)?;
+            let stream = instrument_tcp(stream, diagnostics.as_ref());
             let stream: Box<dyn AsyncIo> = if proxy.tls {
                 let server_name = ServerName::try_from(proxy.config.host.clone())
                     .map_err(|_| WebSocketError::Tls(TlsError::InvalidDnsName))?;
@@ -153,9 +177,25 @@ fn host_port(host: &str, port: u16) -> String {
     }
 }
 
-async fn connect_tcp(address: String) -> io::Result<TcpStream> {
-    let addresses = tokio::net::lookup_host(address).await?.collect::<Vec<_>>();
+async fn connect_tcp(
+    address: String,
+    diagnostics: Option<&TransportDiagnostics>,
+) -> io::Result<TcpStream> {
+    let addresses = tokio::net::lookup_host(&address).await?.collect::<Vec<_>>();
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.resolved(&address, &addresses);
+    }
     connect_happy_eyeballs(addresses, TcpStream::connect).await
+}
+
+fn instrument_tcp(
+    stream: TcpStream,
+    diagnostics: Option<&Arc<TransportDiagnostics>>,
+) -> Box<dyn AsyncIo> {
+    match diagnostics {
+        Some(diagnostics) => Box::new(DiagnosticTcpStream::new(stream, Arc::clone(diagnostics))),
+        None => Box::new(stream),
+    }
 }
 
 async fn connect_happy_eyeballs<T, F, Fut>(
