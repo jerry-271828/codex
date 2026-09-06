@@ -1,14 +1,11 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use app_test_support::ChatGptAuthFixture;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
-use app_test_support::write_chatgpt_auth;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::UserInput;
-use codex_config::types::AuthCredentialsStoreMode;
 use core_test_support::load_default_config_for_test;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
@@ -20,6 +17,7 @@ use tokio::time::timeout;
 use wiremock::Mock;
 use wiremock::Request;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::body_partial_json;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
@@ -115,6 +113,7 @@ async fn app_server_uses_configured_notes_backend_for_context_window_hints(
 
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
+        .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
         .with_model_provider("openai-custom")
         .with_provider_name("OpenAI")
         .with_provider_base_url(&format!("{}/backend-api/codex", server.uri()))
@@ -124,11 +123,7 @@ async fn app_server_uses_configured_notes_backend_for_context_window_hints(
             server.uri(),
         ))
         .write(codex_home.path())?;
-    write_chatgpt_auth(
-        codex_home.path(),
-        ChatGptAuthFixture::new("access-chatgpt"),
-        AuthCredentialsStoreMode::File,
-    )?;
+    mount_analytics_capture(&server, codex_home.path()).await?;
 
     let mut app_server = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -142,7 +137,7 @@ async fn app_server_uses_configured_notes_backend_for_context_window_hints(
     timeout(
         Duration::from_secs(10),
         app_server.start_turn_and_wait_for_completion(TurnStartParams {
-            thread_id: thread.id,
+            thread_id: thread.id.clone(),
             input: vec![UserInput::Text {
                 text: "inspect history and notes".to_string(),
                 text_elements: Vec::new(),
@@ -217,11 +212,28 @@ async fn app_server_uses_configured_notes_backend_for_context_window_hints(
             && item["name"] == "thread_hint"
     }));
 
+    if use_history_notes_extension {
+        let event = wait_for_matching_analytics_event(&server, DEFAULT_READ_TIMEOUT, |event| {
+            event["event_type"] == "codex_thread_hint_status"
+                && event["event_params"]["thread_id"] == thread.id
+        })
+        .await?;
+        assert_eq!(
+            event["event_params"]["status"],
+            if hint_status == 200 {
+                "succeeded"
+            } else {
+                "failed"
+            },
+        );
+    }
+
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn history_notes_and_async_message_emit_control_tool_analytics() -> Result<()> {
+    let encrypted_query = format!("enc_query_{}", "x".repeat(1_001));
     let calls = [
         ("history", "list_windows", json!({})),
         ("history", "list_items", json!({})),
@@ -233,7 +245,7 @@ async fn history_notes_and_async_message_emit_control_tool_analytics() -> Result
         (
             "history",
             "search_contents",
-            json!({"query": "PRIVATE_QUERY"}),
+            json!({"query": encrypted_query, "limit": 2, "recent_first": false}),
         ),
         (
             "notes",
@@ -244,36 +256,41 @@ async fn history_notes_and_async_message_emit_control_tool_analytics() -> Result
         (
             "notes",
             "search_contents",
-            json!({"query": "PRIVATE_QUERY"}),
+            json!({"query": encrypted_query, "max_files": 2}),
         ),
         (
             "notes",
             "append_to_file",
-            json!({"path": "PRIVATE_PATH", "text": "PRIVATE_TEXT"}),
+            json!({"path": "PRIVATE_PATH", "text": "enc_append_text"}),
         ),
         (
             "notes",
             "write_file",
-            json!({"path": "PRIVATE_PATH", "text": "PRIVATE_TEXT"}),
+            json!({"path": "PRIVATE_PATH", "text": "enc_write_text"}),
         ),
         (
             "functions",
-            "send_user_message_async",
-            json!({"message": "PRIVATE_MESSAGE"}),
+            "request_user_input_async",
+            json!({"questions": [{"title": "PRIVATE_MESSAGE"}]}),
         ),
-        ("notes", "list_files_by_prefix", json!({"max_results": 101})),
+        (
+            "notes",
+            "list_files_by_prefix",
+            json!(["PRIVATE_INVALID_ARGUMENTS"]),
+        ),
         (
             "functions",
-            "send_user_message_async",
-            json!({"message": " "}),
+            "request_user_input_async",
+            json!({"questions": [{"title": " "}]}),
         ),
     ];
     let server = responses::start_mock_server().await;
-    for (namespace, tool, _) in &calls[..9] {
+    for (namespace, tool, arguments) in &calls[..9] {
         Mock::given(method("POST"))
             .and(path(format!(
                 "/backend-api/codex/alpha/{namespace}/v2/{tool}"
             )))
+            .and(body_partial_json(arguments.clone()))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({"text": "PRIVATE_RESULT"})),
             )
@@ -349,6 +366,19 @@ async fn history_notes_and_async_message_emit_control_tool_analytics() -> Result
         })
         .await?;
 
+    let request = &response_mock.requests()[0];
+    for (namespace, name, field) in [
+        ("history", "search_contents", "query"),
+        ("notes", "search_contents", "query"),
+        ("notes", "append_to_file", "text"),
+        ("notes", "write_file", "text"),
+    ] {
+        let tool = request
+            .tool_by_name(namespace, name)
+            .expect("declared history or notes tool");
+        assert_eq!(tool["parameters"]["properties"][field]["encrypted"], true);
+    }
+
     for (index, (namespace, tool, _)) in calls.iter().enumerate() {
         let event = wait_for_matching_analytics_event(&server, DEFAULT_READ_TIMEOUT, |event| {
             event["event_type"] == "codex_control_tool_call_event"
@@ -391,6 +421,10 @@ async fn history_notes_and_async_message_emit_control_tool_analytics() -> Result
     assert_eq!(
         response_mock.requests()[10].function_call_output_text("call-9"),
         Some(r#"{"accepted":true}"#.to_string())
+    );
+    assert_eq!(
+        response_mock.requests()[11].function_call_output_text("call-10"),
+        Some("History tool arguments must be a JSON object".to_string())
     );
 
     Ok(())

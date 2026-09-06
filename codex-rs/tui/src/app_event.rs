@@ -54,6 +54,7 @@ use crate::bottom_pane::TerminalTitleItem;
 use crate::chatwidget::ConnectorScopeGeneration;
 use crate::chatwidget::ThreadUsageOutcome;
 use crate::chatwidget::UserMessage;
+use crate::experimental_features::FeatureWriteResult;
 use crate::goal_files::GoalDraft;
 use codex_app_server_protocol::AskForApproval;
 use codex_config::types::ApprovalsReviewer;
@@ -64,6 +65,13 @@ use codex_protocol::config_types::Personality;
 use codex_protocol::models::ActivePermissionProfile;
 
 use crate::history_cell::HistoryCell;
+
+/// Whether a managed checkout starts fresh or preserves the current conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManagedWorktreeMode {
+    New,
+    Fork,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThreadGoalSetMode {
@@ -173,6 +181,10 @@ pub(crate) enum RateLimitRefreshOrigin {
     ResetPicker { request_id: u64 },
     /// Refresh requested after a reset credit was successfully consumed.
     ResetConsume { request_id: u64 },
+    /// Refresh backend recovery after an inference limit error.
+    Recovery,
+    /// Background account usage read, scheduled more frequently near exhaustion.
+    Periodic,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,23 +208,40 @@ pub(crate) enum TranscriptExportDestination {
 }
 
 /// Deliver a generated title to its originating automatic rename or editable prompt.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ThreadTitleDestination {
-    /// Replace the provisional name only if the user has not renamed the thread.
-    Automatic { expected_title: String },
+    /// Name the thread only if the user has not already named it.
+    Automatic,
     /// Prefill only the still-active rename prompt with the matching request ID.
     RenameSuggestion { request_id: Uuid },
+}
+
+/// Identifies the policy that initiated a recap request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecapTrigger {
+    Automatic,
+    Manual,
+}
+
+#[derive(Debug)]
+pub(crate) struct AgentsOverviewThreadRefresh {
+    pub(crate) threads: std::collections::HashMap<ThreadId, Option<Thread>>,
+    pub(crate) last_messages: std::collections::HashMap<ThreadId, String>,
+    pub(crate) recent_seed_complete: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, IntoStaticStr)]
 pub(crate) enum AppEvent {
-    /// Open the daemon-wide overview of loaded root sessions.
+    ReviewMisalignment(Arc<crate::chatwidget::MisalignmentReview>),
+    ContinueMisalignment(Arc<crate::chatwidget::MisalignmentReview>),
+    CloseMisalignmentReview,
+    /// Open the daemon-wide overview of recent and locally retained root sessions.
     OpenAgentsOverview,
     /// Update the daemon-wide overview after a background thread listing finishes.
     AgentsOverviewThreadsLoaded {
         request_id: Uuid,
-        result: Result<Vec<Thread>, String>,
+        result: Result<AgentsOverviewThreadRefresh, String>,
     },
     /// Switch to a root session selected from the shared dashboard.
     SelectAgentsOverviewThread {
@@ -253,10 +282,10 @@ pub(crate) enum AppEvent {
         thread_id: ThreadId,
     },
     /// Start the shared app-server daemon without moving the current embedded session.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     StartAgentsDaemon,
     /// Report whether starting the shared app-server daemon succeeded.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     AgentsDaemonStarted {
         result: Result<(), String>,
     },
@@ -281,6 +310,15 @@ pub(crate) enum AppEvent {
     SubmitThreadOp {
         thread_id: ThreadId,
         op: AppCommand,
+    },
+
+    /// Confirm retrying a safety-buffered turn with the server-selected model.
+    ConfirmSafetyBufferedRetry {
+        thread_id: ThreadId,
+        turn_id: String,
+        model: String,
+        turn: AppCommand,
+        prompt: UserMessage,
     },
 
     /// Interrupt, fork, and retry a safety-buffered turn with the server-selected model.
@@ -322,6 +360,7 @@ pub(crate) enum AppEvent {
     CopySelection {
         text: Arc<str>,
         label: String,
+        format: crate::clipboard_copy::CopyFormat,
     },
 
     /// Persist a submitted prompt in the cross-session message history.
@@ -356,6 +395,12 @@ pub(crate) enum AppEvent {
         name: Option<String>,
     },
 
+    /// Create a managed checkout and start or fork a session into it.
+    StartManagedWorktree {
+        mode: ManagedWorktreeMode,
+        name: Option<String>,
+    },
+
     /// Change the working directory of the originating idle primary thread.
     ChangeWorkingDirectory {
         thread_id: ThreadId,
@@ -364,7 +409,7 @@ pub(crate) enum AppEvent {
 
     /// Result of the fresh startup thread that is attached after the input UI is live.
     StartupThreadStarted {
-        result: Result<AppServerStartedThread, String>,
+        result: color_eyre::Result<AppServerStartedThread>,
     },
 
     /// Register a dynamically created background thread before its first turn starts.
@@ -487,6 +532,11 @@ pub(crate) enum AppEvent {
         origin: RateLimitRefreshOrigin,
     },
 
+    /// Reconcile inherited account usage with an attached task before its queued input runs.
+    ApplyBackendBannerFallback {
+        thread_id: ThreadId,
+    },
+
     /// Open the current thread goal summary/action menu.
     OpenThreadGoalMenu {
         thread_id: ThreadId,
@@ -517,6 +567,7 @@ pub(crate) enum AppEvent {
 
     /// Result of refreshing rate limits.
     RateLimitsLoaded {
+        request_id: u64,
         origin: RateLimitRefreshOrigin,
         hard_stop_generation: u64,
         result: Result<GetAccountRateLimitsResponse, String>,
@@ -594,6 +645,7 @@ pub(crate) enum AppEvent {
 
     /// Result of notifying the workspace owner.
     AddCreditsNudgeEmailFinished {
+        request_id: Uuid,
         result: Result<AddCreditsNudgeEmailStatus, String>,
     },
 
@@ -941,10 +993,15 @@ pub(crate) enum AppEvent {
 
     StartCommitAnimation,
     StopCommitAnimation,
-    CommitTick,
 
     /// Update the current reasoning effort in the running app and widget.
     UpdateReasoningEffort(Option<ReasoningEffort>),
+
+    /// Change Reserve effort only on the task that opened the picker, without saving defaults.
+    UpdateLunaReserveReasoning {
+        thread_id: ThreadId,
+        effort: Option<ReasoningEffort>,
+    },
 
     /// Update the current model slug in the running app and widget.
     UpdateModel(String),
@@ -976,6 +1033,24 @@ pub(crate) enum AppEvent {
         service_tier: Option<String>,
     },
 
+    /// Fetch the current catalog even when cached models produce no picker.
+    FetchModels {
+        request_id: uuid::Uuid,
+    },
+    ModelsLoaded {
+        request_id: uuid::Uuid,
+        result: Result<Vec<ModelPreset>, String>,
+    },
+
+    FetchPermissionProfiles {
+        request_id: uuid::Uuid,
+        thread_cwd: Option<PathBuf>,
+    },
+    PermissionProfilesLoaded {
+        request_id: uuid::Uuid,
+        result: Result<crate::permission_discovery::PermissionDiscovery, String>,
+    },
+
     /// Open the reasoning selection popup after picking a model.
     OpenReasoningPopup {
         model: ModelPreset,
@@ -999,9 +1074,7 @@ pub(crate) enum AppEvent {
     },
 
     /// Open the full model picker (non-auto models).
-    OpenAllModelsPopup {
-        models: Vec<ModelPreset>,
-    },
+    OpenAllModelsPopup,
 
     /// Open the confirmation prompt before enabling full access mode.
     OpenFullAccessConfirmation {
@@ -1031,6 +1104,10 @@ pub(crate) enum AppEvent {
         /// True when the scan failed (e.g. ACL query error) and protections could not be verified.
         failed_scan: bool,
     },
+
+    /// The startup world-writable scan finished and queued any protected warning it requires.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    StartupWorldWritableScanCompleted,
 
     /// Prompt to enable the Windows sandbox feature before using Agent mode.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -1096,10 +1173,28 @@ pub(crate) enum AppEvent {
     /// Update the current approvals reviewer in the running app and widget.
     UpdateApprovalsReviewer(ApprovalsReviewer),
 
+    /// Discover experimental features for the requesting popup only.
+    FetchExperimentalFeatures {
+        thread_id: ThreadId,
+        response_tx: tokio::sync::oneshot::Sender<
+            Result<Vec<codex_app_server_protocol::ExperimentalFeature>, String>,
+        >,
+    },
+
     /// Update feature flags and persist them to the top-level config.
     UpdateFeatureFlags {
         updates: Vec<(Feature, bool)>,
     },
+
+    /// Save generic menu controls without changing running-task settings.
+    SaveExperimentalFeatures {
+        thread_id: ThreadId,
+        updates: Vec<(String, bool)>,
+        response_tx: tokio::sync::oneshot::Sender<Result<FeatureWriteResult, String>>,
+    },
+
+    /// Save an enable prompt on the app server without changing the current thread.
+    EnableFeatureForNewThreads(Feature),
 
     /// Update memory settings and persist them to config.toml.
     UpdateMemorySettings {
@@ -1322,6 +1417,38 @@ pub(crate) enum AppEvent {
         context: String,
         action: String,
     },
+
+    /// Generate a recap for the displayed idle thread at the user's request.
+    GenerateRecap {
+        thread_id: ThreadId,
+    },
+
+    /// Recheck whether an unfocused thread is ready for an automatic recap.
+    CheckRecap {
+        thread_id: ThreadId,
+    },
+
+    /// Deliver the result of starting a recap's temporary thread.
+    RecapStarted {
+        thread_id: ThreadId,
+        request_id: Uuid,
+        trigger: RecapTrigger,
+        completed_turn_count: usize,
+        turn_revision: usize,
+        history: String,
+        result: Result<String, String>,
+    },
+
+    /// Deliver the generated recap from a temporary structured turn.
+    RecapGenerated {
+        thread_id: ThreadId,
+        request_id: Uuid,
+        trigger: RecapTrigger,
+        temporary_thread_id: ThreadId,
+        completed_turn_count: usize,
+        turn_revision: usize,
+        result: Result<String, String>,
+    },
 }
 
 /// Named profile selection to apply after any required UI guardrails complete.
@@ -1342,6 +1469,8 @@ pub(crate) struct PermissionProfileSelection {
 pub(crate) enum ExitMode {
     /// Shutdown core and exit after completion.
     ShutdownFirst,
+    /// Unsubscribe and exit after the current turn was successfully interrupted.
+    ShutdownAfterInterrupt,
     /// Exit the UI loop immediately without waiting for shutdown.
     ///
     /// This skips `Op::Shutdown`, so any in-flight work may be dropped and
