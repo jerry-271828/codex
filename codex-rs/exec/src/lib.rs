@@ -3,6 +3,10 @@
 // - In --json mode, stdout must be valid JSONL, one event per line.
 // For both modes, any other output must be written to stderr.
 #![deny(clippy::print_stdout)]
+// Deeply nested instrumented async blocks (e.g. app-server's
+// dispatch_initialized_client_request) overflow rustc's default query depth
+// limit when computing type layouts in this crate.
+#![recursion_limit = "256"]
 
 mod cli;
 mod event_processor;

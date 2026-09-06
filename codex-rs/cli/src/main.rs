@@ -1,3 +1,8 @@
+// Deeply nested instrumented async blocks (e.g. app-server's
+// dispatch_initialized_client_request) overflow rustc's default query depth
+// limit when computing type layouts in this crate.
+#![recursion_limit = "256"]
+
 use clap::Args;
 use clap::CommandFactory;
 use clap::Parser;
